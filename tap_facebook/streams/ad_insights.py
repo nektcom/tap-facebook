@@ -428,11 +428,12 @@ MAX_AUTO_FIELD_DROPS = 3
 # rate limit of N calls per M hours for this ad account").
 THROTTLE_ERROR_CODES = (4, 17, 613)
 
-# How many slices a single degraded report may cover. The quota is spent per
-# report CREATED, not per day of data, so one report spanning the whole pending
-# window costs one call instead of one per day. Capped so that a first backfill
-# does not turn into a single job Facebook cannot build.
-THROTTLE_SPAN_MAX_SLICES = 31
+# How many slices one report may cover. The quota is spent per report CREATED,
+# not per day of data, so asking for the window in one go costs a single call
+# while `time_increment` still returns the same per-slice rows. This is the
+# normal request shape, not a degradation (NEKT-5213). Capped so that a first
+# backfill does not turn into a single job Facebook cannot build.
+SPAN_MAX_SLICES = 31
 
 # Facebook says how long until the quota frees up, but that can be hours --
 # longer than a run should sit idle, since the next scheduled run would get
@@ -503,7 +504,11 @@ class AdsInsightStream(FacebookSDKStream):
         self._dates_failed = 0
         self._throttled = False
         self._throttle_wait = 0
-        self._span_mode = False
+        # One report per window is the DEFAULT shape, not a reaction to being
+        # throttled: it returns the same rows for a fraction of the quota. The
+        # per-slice shape is the fallback, entered only when Facebook cannot
+        # build the span job (see _give_up_on_span).
+        self._span_mode = True
         self._span_disabled = False
         self._span_failed_from: pendulum.Date | None = None
         # Set when report creation is refused for quota while a batch is being
@@ -534,29 +539,6 @@ class AdsInsightStream(FacebookSDKStream):
             exc_info=True,
         )
 
-    def _enter_span_mode(self) -> bool:
-        """Switch to one report for the whole pending window. True if it flipped.
-
-        Facebook meters these reports per report created, not per day of data,
-        so asking for the window in one go costs a single call while returning
-        the same daily rows (`time_increment` still slices the result set).
-        That is the only lever left once the quota is gone.
-        """
-        if self._span_mode or self._span_disabled:
-            return False
-
-        self._span_mode = True
-        user_logger.warning(
-            f"[{self.name}] Facebook is limiting how many performance reports this ad account "
-            "may request right now. Asking for the whole period in a single report instead of "
-            "one per day, which costs a single request. The data extracted is the same."
-        )
-        internal_logger.warning(
-            f"[{self.name}] Throttled on report creation; degrading to one span report of up to "
-            f"{THROTTLE_SPAN_MAX_SLICES} slice(s) for the rest of the run."
-        )
-        return True
-
     def _warn_throttle_is_unrecoverable(self) -> None:
         """Tell the customer the quota is gone and one request is already the floor."""
         user_logger.warning(
@@ -566,12 +548,12 @@ class AdsInsightStream(FacebookSDKStream):
             "often, or having fewer tools query the same ad account, keeps the limit from being hit."
         )
         internal_logger.warning(
-            f"[{self.name}] Throttled while already in span mode (or with span mode disabled); "
-            "no further degradation is available."
+            f"[{self.name}] Throttled while already asking for the window in one report (or with "
+            "the span shape disabled); no further reduction is available."
         )
 
     def _give_up_on_span(self, resume_from: pendulum.Date, report_label: str) -> None:
-        """Abandon the degraded report and go back to one report per slice.
+        """Fall back from the single-window report to one report per slice.
 
         Splitting the range is what Facebook itself recommends for a job that is
         too heavy to build, so the span is never retried again in this run: that
@@ -942,7 +924,8 @@ class AdsInsightStream(FacebookSDKStream):
         self._throttled = False
 
         if self._span_mode:
-            # One report for the whole window, so the batch is a single request.
+            # The default: one report for the whole window, so the batch is a
+            # single request instead of one per slice.
             batch_size = 1
             self._wait_out_throttle()
 
@@ -953,7 +936,7 @@ class AdsInsightStream(FacebookSDKStream):
             next_date = self._advance_date(current_date, time_increment)
             span_until = None
             if self._span_mode:
-                next_date = self._advance_batch(current_date, time_increment, THROTTLE_SPAN_MAX_SLICES, end_date)
+                next_date = self._advance_batch(current_date, time_increment, SPAN_MAX_SLICES, end_date)
                 span_until = min(next_date.subtract(days=1), end_date)
 
             params = {
@@ -1545,23 +1528,16 @@ class AdsInsightStream(FacebookSDKStream):
                     continue
 
                 if not batch_reports:
-                    if self._throttled and self._enter_span_mode():
-                        # Same window, asked for as one report instead of one per
-                        # slice. Nothing was queued, so no date is requested twice.
-                        continue
                     if self._throttled:
+                        # The window is already one request; there is no smaller
+                        # shape left to ask for.
                         self._warn_throttle_is_unrecoverable()
                     # Nothing queued: skip the whole span this batch just tried,
                     # not a single date -- otherwise every date is re-requested
                     # up to batch_size times before the window moves past it.
-                    attempted = THROTTLE_SPAN_MAX_SLICES if self._span_mode else batch_size
+                    attempted = SPAN_MAX_SLICES if self._span_mode else batch_size
                     report_date = self._advance_batch(report_date, time_increment, attempted, sync_end_date)
                     continue
-
-                if self._throttled:
-                    # Part of the batch was queued before the quota ran out. Take
-                    # what it produced, then ask for the rest in one report.
-                    self._enter_span_mode()
 
                 # Process all reports in the batch
                 for record in self._process_report_batch(batch_reports, columns, time_increment):
@@ -1584,11 +1560,8 @@ class AdsInsightStream(FacebookSDKStream):
                     # retried forever.
                     resume_from = self._throttled_from
                     self._throttled_from = None
-                    if self._enter_span_mode():
-                        report_date = resume_from
-                        continue
                     self._warn_throttle_is_unrecoverable()
-                    attempted = THROTTLE_SPAN_MAX_SLICES if self._span_mode else batch_size
+                    attempted = SPAN_MAX_SLICES if self._span_mode else batch_size
                     report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
                     continue
 
