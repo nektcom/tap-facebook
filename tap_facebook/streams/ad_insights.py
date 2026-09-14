@@ -506,6 +506,9 @@ class AdsInsightStream(FacebookSDKStream):
         self._span_mode = False
         self._span_disabled = False
         self._span_failed_from: pendulum.Date | None = None
+        # Set when report creation is refused for quota while a batch is being
+        # processed, so the caller can resume that window as a single report.
+        self._throttled_from: pendulum.Date | None = None
 
     def _note_throttled(self, fb_err: FacebookRequestError, current_date: pendulum.Date) -> None:
         """Record that Facebook refused a report because the quota is spent.
@@ -526,7 +529,7 @@ class AdsInsightStream(FacebookSDKStream):
         internal_logger.warning(
             f"[{self.name}] Report creation for {current_date.to_date_string()} was throttled "
             f"(code {fb_err.api_error_code()}, subcode {fb_err.api_error_subcode()}): "
-            f"{fb_err.api_error_message()}. Stopping the batch; Facebook suggests waiting "
+            f"{fb_err.api_error_message()}. Stopping here; Facebook suggests waiting "
             f"{suggested}s, this run will wait {self._throttle_wait}s.",
             exc_info=True,
         )
@@ -1085,6 +1088,13 @@ class AdsInsightStream(FacebookSDKStream):
                 return response.json()["report_run_id"]
             channel.warning(f"[{self.name}] Failed to queue retry report for {label}")
         except FacebookRequestError as fb_err:
+            if fb_err.api_error_code() in THROTTLE_ERROR_CODES:
+                # Out of quota, not a bad request. Record it and stay quiet on the
+                # customer channel: the caller decides what to do about it and
+                # emits the single message that explains the whole run, instead of
+                # one line per refused date.
+                self._note_throttled(fb_err, date)
+                return None
             channel.warning(f"[{self.name}] Error queueing retry report for {label}: {fb_err.api_error_message()}")
             internal_logger.warning(
                 f"[{self.name}] Retry report creation failed for {label} "
@@ -1182,7 +1192,24 @@ class AdsInsightStream(FacebookSDKStream):
         if self._auto_drops >= MAX_AUTO_FIELD_DROPS:
             return False
 
+        if self._throttled:
+            # A refused report says nothing about the columns. Probing now would
+            # spend what is left of the quota and then blame the fields for it.
+            internal_logger.warning(
+                f"[{self.name}] Skipping the column bisect for {date_obj.to_date_string()}: the job "
+                "failures are a spent ad account quota, not a rejected field."
+            )
+            return False
+
         dropped = self._bisect_failing_columns(date_obj, columns, time_increment)
+        if self._throttled:
+            # The quota ran out during the probes, so their failures are not
+            # evidence against any column. Leave the field set untouched.
+            internal_logger.warning(
+                f"[{self.name}] Column bisect for {date_obj.to_date_string()} was cut short by the ad "
+                "account quota; the field set is left as it is."
+            )
+            return False
         if not dropped:
             # Not one field, or not a field at all. Fall back to the contract set
             # once, so the run still delivers the core metrics for every date.
@@ -1235,6 +1262,13 @@ class AdsInsightStream(FacebookSDKStream):
                     time.sleep(60)
                     report_run_id = self._create_single_report(date_obj, columns, time_increment, until=span_until)
                     if not report_run_id:
+                        if self._throttled:
+                            # The ad account's budget is spent. The nine attempts
+                            # left here, and every later date in this batch, are
+                            # nine more refused calls that keep it spent: stop and
+                            # let the caller ask for the rest in one report.
+                            self._throttled_from = date_obj
+                            return
                         continue
 
                 job = self._run_job_to_completion(
@@ -1539,6 +1573,23 @@ class AdsInsightStream(FacebookSDKStream):
                     # date that failed, so dates already yielded in this batch are
                     # not emitted twice.
                     columns, report_date = self._resume_after_rejection(columns, report_date)
+                    continue
+
+                if self._throttled_from is not None:
+                    # Processing ran into the ad account's limit. Nothing was
+                    # emitted for that date, so the window can be asked for again
+                    # -- but as one report, the single call the account can still
+                    # afford. When that is already the shape being used, there is
+                    # nothing left to shrink, so the window is skipped instead of
+                    # retried forever.
+                    resume_from = self._throttled_from
+                    self._throttled_from = None
+                    if self._enter_span_mode():
+                        report_date = resume_from
+                        continue
+                    self._warn_throttle_is_unrecoverable()
+                    attempted = THROTTLE_SPAN_MAX_SLICES if self._span_mode else batch_size
+                    report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
                     continue
 
                 if self._span_failed_from is not None:
