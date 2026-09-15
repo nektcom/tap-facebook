@@ -435,6 +435,19 @@ THROTTLE_ERROR_CODES = (4, 17, 613)
 # backfill does not turn into a single job Facebook cannot build.
 SPAN_MAX_SLICES = 31
 
+# A span job that Facebook fails to build is recreated this many times before
+# the shape is given up on. Most job failures on a healthy account are transient
+# (~14% of jobs die at 0% and succeed on the next attempt), so one retry is
+# cheap insurance; more than that is spending the account's request budget on
+# a job that is not going to build.
+SPAN_RETRIES = 1
+
+# How many times a per-slice report is recreated after its job fails. Each
+# retry is a new report, i.e. a new call against the account's budget. Ten
+# recreations of a report Facebook cannot build never succeeded; they only kept
+# the account throttled (NEKT-5249).
+PER_SLICE_RETRIES = 2
+
 # Facebook says how long until the quota frees up, but that can be hours --
 # longer than a run should sit idle, since the next scheduled run would get
 # there sooner. Wait a little (a throttle is often a burst) and then spend the
@@ -464,6 +477,12 @@ class AdsInsightStream(FacebookSDKStream):
     name = "adsinsights"
     replication_key = "date_start"
     api_sleep_time = 60
+
+    # Set on the class -- i.e. for the whole tap process -- the moment one
+    # insights stream finds that Facebook will not build even a single-slice
+    # report for the ad account. Every other insights stream of the same run
+    # checks it before spending calls of its own on the same refusal.
+    _account_not_building: bool = False
 
     @property
     def effective_granularity(self) -> str:
@@ -504,6 +523,9 @@ class AdsInsightStream(FacebookSDKStream):
         self._dates_failed = 0
         self._throttled = False
         self._throttle_wait = 0
+        # Facebook's own reason for the last job that ended as "Job Failed".
+        self._last_job_error: dict = {}
+        self._throttle_headers_logged = False
         # One report per window is the DEFAULT shape, not a reaction to being
         # throttled: it returns the same rows for a fraction of the quota. The
         # per-slice shape is the fallback, entered only when Facebook cannot
@@ -538,6 +560,27 @@ class AdsInsightStream(FacebookSDKStream):
             f"{suggested}s, this run will wait {self._throttle_wait}s.",
             exc_info=True,
         )
+        self._log_throttle_headers(fb_err.http_headers() or {}, when="creation refused")
+
+    def _log_throttle_headers(self, headers: dict, *, when: str) -> None:
+        """Ship Facebook's own view of the account's budget, verbatim.
+
+        `x-fb-ads-insights-throttle` is the insights-specific header (access
+        tier plus per-app and per-account utilisation) and nothing else in the
+        tap reads it; the generic call-count headers sat at 0% seconds before
+        an account was refused. Logged raw, so a new field from Facebook shows
+        up without a parser change.
+        """
+
+        def pick(name: str):
+            return headers.get(name) or headers.get(name.lower()) or headers.get(name.title())
+
+        internal_logger.info(
+            f"[{self.name}] Throttle headers ({when}) for act_{self.config.get('account_id')}: "
+            f"x-fb-ads-insights-throttle={pick('X-FB-Ads-Insights-Throttle')!r} "
+            f"x-business-use-case-usage={pick('X-Business-Use-Case-Usage')!r} "
+            f"x-ad-account-usage={pick('X-Ad-Account-Usage')!r}"
+        )
 
     def _warn_throttle_is_unrecoverable(self) -> None:
         """Tell the customer the quota is gone and one request is already the floor."""
@@ -563,7 +606,7 @@ class AdsInsightStream(FacebookSDKStream):
         self._span_disabled = True
         self._span_failed_from = resume_from
         user_logger.warning(
-            f"[{self.name}] The single report covering {report_label} was too heavy for Facebook to build. "
+            f"[{self.name}] The single report covering {report_label} could not be built by Facebook. "
             "Falling back to one report per day, which may run into the account's request limit."
         )
         internal_logger.warning(
@@ -870,6 +913,9 @@ class AdsInsightStream(FacebookSDKStream):
         return th.PropertiesList(*properties).to_dict()
 
     def _check_facebook_api_usage(self, headers: str) -> None:
+        if not getattr(self, "_throttle_headers_logged", False):
+            self._throttle_headers_logged = True
+            self._log_throttle_headers(dict(headers or {}), when="first accepted creation")
         should_sleep = has_reached_api_limit(
             headers=headers,
             account_id=self.config.get("account_id"),
@@ -1228,7 +1274,7 @@ class AdsInsightStream(FacebookSDKStream):
         """
         user_logger.info(f"[{self.name}] Processing batch of {len(batch_reports)} reports...")
         fail_on_error = self.config.get("fail_on_job_error", False)
-        max_retries = 10
+        max_retries = PER_SLICE_RETRIES
 
         for report_info in batch_reports:
             report_run_id = report_info["report_run_id"]
@@ -1260,11 +1306,14 @@ class AdsInsightStream(FacebookSDKStream):
                 )
                 if not isinstance(job, AdReportRun):
                     if span_until is not None:
-                        # A span report is only ever used to survive a throttle.
-                        # If Facebook cannot build it, splitting the range back
-                        # into one report per slice is the documented remedy --
-                        # and cheaper than retrying a job that is too heavy.
-                        self._give_up_on_span(date_obj, report_date)
+                        if attempt < SPAN_RETRIES and not self._throttled:
+                            # One more try before giving the shape up: most job
+                            # failures on a healthy account are transient.
+                            continue
+                        # Twice is enough. Whether the window is too big or the
+                        # account is refusing every report is decided by one
+                        # single-slice probe, not by a 13-30 report burst.
+                        yield from self._leave_span(date_obj, report_date, columns, time_increment)
                         return
                     job_failures += 1
                     if job_failures >= CONSECUTIVE_FAILURES_BEFORE_BISECT and self._drop_columns_failing_the_job(
@@ -1314,9 +1363,9 @@ class AdsInsightStream(FacebookSDKStream):
                 #      keeps an all-failed run from overwriting the table with an
                 #      empty snapshot.
                 if span_until is not None:
-                    # Same reasoning as a span job that never builds: go back to
-                    # one report per slice rather than write the whole range off.
-                    self._give_up_on_span(date_obj, report_date)
+                    # Same reasoning as a span job that never builds: probe one
+                    # slice rather than write the whole range off or burst.
+                    yield from self._leave_span(date_obj, report_date, columns, time_increment)
                     return
                 self._dates_failed += 1
                 msg = (
@@ -1377,7 +1426,7 @@ class AdsInsightStream(FacebookSDKStream):
             if status == "Job Completed":
                 return job
             if status == "Job Failed":
-                channel.error(f"[{self.name}] Insights job {job_id} failed for {report_date}. " + JOB_STALE_ERROR_MESSAGE)
+                self._record_job_failure(job, job_id, report_date, channel)
                 return
             if duration > INSIGHTS_MAX_WAIT_TO_START_SECONDS and percent_complete == 0:
                 channel.error(
@@ -1396,6 +1445,127 @@ class AdsInsightStream(FacebookSDKStream):
             time.sleep(POLL_JOB_SLEEP_TIME)
         user_logger.error(f"[{self.name}] Job failed to complete for unknown reason")
         sys.exit(1)
+
+    def _record_job_failure(self, job: th.Any, job_id: str, report_date: str, channel: th.Any) -> None:
+        """Log why Facebook failed the job, in Facebook's own words.
+
+        Since Graph API v25 a failed AdReportRun carries error_code,
+        error_subcode, error_message, error_user_title and error_user_msg. They
+        were being discarded, which left the customer with a generic
+        "intermittent error" and the engineer with a guess. A quota code here
+        is a throttle: the report was created, but the account had no budget
+        left to build it.
+        """
+        fields: dict = {}
+        for name in ("error_code", "error_subcode", "error_message", "error_user_title", "error_user_msg"):
+            try:
+                value = job[name]
+            except (KeyError, TypeError, IndexError):
+                value = None
+            if value not in (None, ""):
+                fields[name] = value
+        self._last_job_error = fields
+
+        line = f"[{self.name}] Insights job {job_id} failed for {report_date}."
+        if fields.get("error_user_title"):
+            line += f" Facebook says: {fields['error_user_title']}."
+        reason = fields.get("error_user_msg") or fields.get("error_message")
+        line += f" {reason}" if reason else " " + JOB_STALE_ERROR_MESSAGE
+        channel.error(line)
+        internal_logger.error(
+            f"[{self.name}] AdReportRun {job_id} for {report_date} ended as Job Failed on "
+            f"act_{self.config.get('account_id')}: "
+            + (" ".join(f"{k}={v!r}" for k, v in fields.items()) if fields else "no error fields on the job object")
+        )
+
+        try:
+            code = int(fields["error_code"])
+        except (KeyError, TypeError, ValueError):
+            code = None
+        if code in THROTTLE_ERROR_CODES:
+            self._throttled = True
+
+    def _leave_span(
+        self,
+        date_obj: pendulum.Date,
+        report_label: str,
+        columns: list[str],
+        time_increment: int | str,
+    ) -> t.Iterator[dict]:
+        """Decide, with one single-slice probe, whether per-slice reports are worth it.
+
+        The span job failed twice. On a healthy account that means the window
+        is too big for one job, and one report per slice is Facebook's own
+        remedy. On an account Facebook is currently not building reports for,
+        that same fallback is 13-30 creations that all fail and leave the
+        account throttled -- which is what kept those pipelines down (NEKT-5249).
+        The two cases look identical from the span job alone, so spend exactly
+        one more creation to tell them apart.
+        """
+        if self._throttled:
+            self._throttled_from = date_obj
+            return
+
+        probe_label = date_obj.to_date_string()
+        user_logger.info(
+            f"[{self.name}] Checking whether Facebook can build a single-day report for {probe_label} "
+            "before asking for the period one day at a time."
+        )
+        probe_id = self._create_single_report(date_obj, columns, time_increment)
+        if not probe_id:
+            if self._throttled:
+                self._throttled_from = date_obj
+            else:
+                self._mark_account_not_building(report_label, "the single-day report could not be created either")
+            return
+
+        job = self._run_job_to_completion(report_instance=AdReportRun(probe_id), report_date=probe_label)
+        if not isinstance(job, AdReportRun):
+            self._mark_account_not_building(report_label, f"the single-day report for {probe_label} failed the same way")
+            return
+
+        try:
+            for obj in job.get_result():
+                if isinstance(obj, AdsInsights):
+                    obj["id"] = self._generate_hash_id(adinsight=obj, report_breakdowns=self.report_breakdowns)
+                    yield obj.export_all_data()
+        except FacebookRequestError as fb_err:
+            # The probe built; reading it back failed. Nothing was emitted for
+            # this slice, so hand it to the per-slice path unchanged.
+            internal_logger.warning(
+                f"[{self.name}] Probe report {probe_id} for {probe_label} built but could not be read "
+                f"(code {fb_err.api_error_code()}): {fb_err.api_error_message()}",
+                exc_info=True,
+            )
+            self._give_up_on_span(date_obj, report_label)
+            return
+
+        # The account builds single-slice reports: the span really was too big.
+        # The probe's slice is already emitted, so resume right after it.
+        self._give_up_on_span(self._advance_date(date_obj, time_increment), report_label)
+
+    def _mark_account_not_building(self, report_label: str, why: str) -> None:
+        """Stop this stream, and every later insights stream of the run, cheaply.
+
+        Recorded on the class so the other insights streams of the same process
+        read it before spending their own span + retry + probe on the same
+        account. It is an observation about the ad account, not the stream.
+        """
+        AdsInsightStream._account_not_building = True
+        self._dates_failed += 1
+        user_logger.error(
+            f"[{self.name}] Facebook is not building performance reports for this ad account right now: "
+            f"the report covering {report_label} failed twice, and {why}. The extraction stopped here rather "
+            "than requesting the period one day at a time, which would only spend the account's request "
+            "limit on reports that fail the same way. Existing data was left untouched. This is a limit on "
+            "Facebook's side; it has cleared on its own within a few days for other accounts, and the next "
+            "scheduled run will try again."
+        )
+        internal_logger.error(
+            f"[{self.name}] act_{self.config.get('account_id')}: span job failed {SPAN_RETRIES + 1}x and {why}; "
+            f"last job error: {self._last_job_error!r}. Marked the account as not building for the rest of "
+            "this process so the other insights streams do not repeat the cost."
+        )
 
     def _get_selected_columns(self) -> list[str]:
         columns = [keys[1] for keys, data in self.metadata.items() if data.selected and len(keys) > 0]
@@ -1479,6 +1649,19 @@ class AdsInsightStream(FacebookSDKStream):
         context: dict | None,
     ) -> t.Iterable[dict | tuple[dict, dict | None]]:
         self._initialize_client()
+        account_id = self.config.get("account_id")
+        internal_logger.info(f"[{self.name}] Syncing insights for ad account act_{account_id}")
+        if AdsInsightStream._account_not_building:
+            user_logger.error(
+                f"[{self.name}] Skipped: an earlier stream of this run found that Facebook is not building "
+                "performance reports for this ad account right now. Existing data was left untouched; the "
+                "next scheduled run will try again."
+            )
+            internal_logger.error(
+                f"[{self.name}] act_{account_id}: skipping the stream, the account was marked as not "
+                "building earlier in this process."
+            )
+            sys.exit(1)
         time_increment = self._effective_time_increment
 
         if self.effective_granularity != "daily":
@@ -1543,6 +1726,11 @@ class AdsInsightStream(FacebookSDKStream):
                 for record in self._process_report_batch(batch_reports, columns, time_increment):
                     records_emitted += 1
                     yield record
+
+                if AdsInsightStream._account_not_building:
+                    # Nothing this run can do for the rest of the period; the
+                    # floor below decides whether it ends red.
+                    break
 
                 if self._rejected_columns:
                     # A column was refused while reading results: resume from the
