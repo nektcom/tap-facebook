@@ -117,12 +117,15 @@ class TestSpanFailure:
         # 1 span retry + 1 single-slice probe. Not 14 per-day reports.
         assert create.call_count == 2
         probe_call = create.call_args_list[1]
-        assert probe_call.args[0] == START
+        # The probe asks for the newest slice of the window: the oldest one may
+        # sit at the edge of Facebook's retention and fail on age alone.
+        assert probe_call.args[0] == UNTIL
         assert probe_call.kwargs.get("until") is None, "the probe is a single slice"
-        # The probe built, so the account works: per-slice is the right fallback,
-        # resuming right after the slice the probe already delivered.
+        # The probe built, so the account works: per-slice is the right fallback.
+        # The probe was a diagnostic (its rows are not emitted), so the per-slice
+        # pass starts at the beginning of the window.
         assert stream._span_mode is False
-        assert stream._span_failed_from == START.add(days=1)
+        assert stream._span_failed_from == START
         assert AdsInsightStream._account_not_building is False
         assert stream._dates_failed == 0
 
@@ -144,6 +147,8 @@ class TestSpanFailure:
         message = user_log.error.call_args.args[0]
         assert "not building performance reports" in message
         assert "left untouched" in message
+        # The verdict names the probe slice (the newest one) and the wait before it.
+        assert UNTIL.to_date_string() in message
 
     def test_a_refused_probe_creation_is_a_throttle_not_a_verdict(self):
         stream = make_stream()
