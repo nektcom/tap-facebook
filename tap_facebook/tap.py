@@ -433,6 +433,17 @@ class TapFacebook(Tap):
             ),
         ),
         th.Property(
+            "insights_included_fields",
+            th.ArrayType(th.StringType),
+            default=[],
+            description=(
+                "Ads Insights metrics the tap leaves out by default because Facebook does not build "
+                "reports that contain them (for example total_card_view) and that this account wants "
+                "requested anyway. Use only after checking in the Graph API Explorer that the metric "
+                "builds for the ad account; otherwise every insights report of the source fails."
+            ),
+        ),
+        th.Property(
             "fail_on_job_error",
             th.BooleanType,
             default=False,

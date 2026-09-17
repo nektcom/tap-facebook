@@ -438,6 +438,19 @@
             "docs_url": "https://docs.nekt.com/sources/facebook-ads#ad-insights",
             "description": "Metric names Facebook cannot serve for this ad account. Facebook rejects an entire report when one metric does not apply to the account, so the extraction detects and drops those on its own -- listing them here only makes it permanent and slightly faster. The columns remain in the table and arrive empty."
           },
+          "insights_included_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "order": 30,
+            "title": "Ads Insights: metrics to force",
+            "default": [],
+            "el_type": "extractor",
+            "advanced_settings": true,
+            "docs_url": "https://docs.nekt.com/sources/facebook-ads#ad-insights",
+            "description": "Metrics the extraction leaves out by default because Facebook does not build reports that contain them (for example total_card_view). List one here only after confirming in the Graph API Explorer that it builds for this ad account; otherwise every insights report of the source fails."
+          },
           "include_insights_attribution_fields": {
             "type": "boolean",
             "order": 25,

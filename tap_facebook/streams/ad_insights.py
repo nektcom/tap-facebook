@@ -310,6 +310,18 @@ REJECTED_FIELDS = {
     "total_postbacks_detailed_v4": "cannot be combined with other fields",
 }
 
+# Fields the Graph API accepts but does not BUILD: the async job dies at 0%
+# with 2/1504044 even when the field is requested alone, for a single day.
+# Found by bisecting the STANDARD group in the Graph API Explorer on
+# act_1049955961115823 (17/09/2026): the other 68 STANDARD fields build
+# together, this one fails on its own. Unlike REJECTED_FIELDS these stay in the
+# schema -- the column keeps existing in the warehouse, it arrives empty -- and
+# are simply not requested. A source that needs one can put it back with the
+# `insights_included_fields` config key, at its own risk.
+FIELDS_NOT_BUILT_BY_FACEBOOK = {
+    "total_card_view": "async job fails with 2/1504044 even alone (Instant Experience metric)",
+}
+
 # Sub-properties of the AdsActionStats / AdsHistogramStats nested objects.
 # Same rule: pinned so an SDK bump cannot reshape nested records.
 ACTION_STATS_FIELDS = [
@@ -550,6 +562,12 @@ class AdsInsightStream(FacebookSDKStream):
     # in parts too instead of failing the full report twice each.
     _account_split_mode: bool = False
 
+    # Names of the parts this process has already had to cut in halves
+    # because Facebook would not build them whole (see _halve_part). The
+    # next windows, and the other insights streams of the run, ask for the
+    # halves directly instead of paying the failed whole again.
+    _account_halved_parts: frozenset[str] = frozenset()
+
     @property
     def effective_granularity(self) -> str:
         """Return the resolved granularity for this stream.
@@ -778,7 +796,31 @@ class AdsInsightStream(FacebookSDKStream):
                     continue
                 name = label if pieces == 1 else f"{label}-{number + 1}"
                 parts.append((name, [key for key in keys if key not in chunk] + chunk))
-        return parts
+        # Parts Facebook already refused to build whole in this process are
+        # asked for as halves from the start.
+        expanded: list[tuple[str, list[str]]] = []
+        for name, part_columns in parts:
+            halves = self._halve_part(name, part_columns) if name in AdsInsightStream._account_halved_parts else None
+            expanded.extend(halves or [(name, part_columns)])
+        return expanded
+
+    def _halve_part(self, name: str, columns: list[str]) -> list[tuple[str, list[str]]] | None:
+        """Cut one part in two, each half carrying the join keys.
+
+        The weight Facebook refuses is per field type, not per count: on
+        act_1049955961115823 (17/09/2026) 35 STANDARD fields built in one
+        report while 10 BETA fields did not -- and every half of the refused
+        groups built. Returns None when there is nothing left to cut.
+        """
+        keys = self._split_key_fields()
+        metrics = [column for column in columns if column not in keys]
+        if len(metrics) < 2:
+            return None
+        middle = -(-len(metrics) // 2)
+        return [
+            (f"{name}-a", [key for key in keys if key not in metrics[:middle]] + metrics[:middle]),
+            (f"{name}-b", [key for key in keys if key not in metrics[middle:]] + metrics[middle:]),
+        ]
 
     def _has_optional_columns(self, columns: list[str]) -> bool:
         _, grouped = self._partition_columns(columns)
@@ -1766,9 +1808,33 @@ class AdsInsightStream(FacebookSDKStream):
     ) -> bool:
         """Recreate the report of every part whose job did not build.
 
-        Returns False when one of them could not be created; `_throttled` then
-        says whether that was the quota.
+        A part that did not build whole is recreated as two halves (once: a
+        half that fails again is recreated as it is). The cut is remembered
+        on the class so the next windows and the other insights streams ask
+        for the halves directly. Returns False when a report could not be
+        created; `_throttled` then says whether that was the quota.
         """
+        rebuilt: list[dict] = []
+        for part in parts:
+            if part.get("report_run_id") or part.get("halved") or len(parts) == 1:
+                rebuilt.append(part)
+                continue
+            halves = self._halve_part(part["name"], part["columns"])
+            if not halves:
+                rebuilt.append(part)
+                continue
+            AdsInsightStream._account_halved_parts = AdsInsightStream._account_halved_parts | {part["name"]}
+            rebuilt.extend({"name": name, "columns": columns, "report_run_id": None, "halved": True} for name, columns in halves)
+            user_logger.info(
+                f"[{self.name}] Facebook did not build the '{part['name']}' report for {date_obj.to_date_string()}"
+                f"{' to ' + until.to_date_string() if until else ''}; asking for its metrics in two smaller reports."
+            )
+            internal_logger.info(
+                f"[{self.name}] Part '{part['name']}' ({len(part['columns'])} columns) halved into "
+                f"{' + '.join(f'{name} ({len(columns)})' for name, columns in halves)}; remembered for the process."
+            )
+        parts[:] = rebuilt
+
         for part in parts:
             if part.get("report_run_id"):
                 continue
@@ -2174,6 +2240,17 @@ class AdsInsightStream(FacebookSDKStream):
             internal_logger.info(
                 f"[{self.name}] {len(excluded)} field(s) excluded by configuration: {', '.join(sorted(excluded))}"
             )
+        # Fields Facebook does not build (see FIELDS_NOT_BUILT_BY_FACEBOOK) are
+        # left out unless the source asks for them back explicitly.
+        forced_back = set(self.config.get("insights_included_fields") or [])
+        not_built = {f for f in FIELDS_NOT_BUILT_BY_FACEBOOK if f in columns and f not in forced_back}
+        if not_built:
+            internal_logger.info(
+                f"[{self.name}] {len(not_built)} field(s) not requested because Facebook does not build them: "
+                + ", ".join(f"{f} ({FIELDS_NOT_BUILT_BY_FACEBOOK[f]})" for f in sorted(not_built))
+            )
+        excluded |= not_built
+        if excluded:
             columns = [column for column in columns if column not in excluded]
 
         # don't pass along columns that are part of breakdowns

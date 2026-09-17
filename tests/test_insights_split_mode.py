@@ -31,6 +31,7 @@ from facebook_business.adobjects.adsinsights import AdsInsights
 
 from tap_facebook.streams.ad_insights import (
     BASIC_FIELDS,
+    FIELDS_NOT_BUILT_BY_FACEBOOK,
     RESULTS_FIELDS,
     SPLIT_MODE_STATE_KEY,
     SPLIT_MODE_TTL_DAYS,
@@ -56,6 +57,7 @@ STANDARD = STANDARD_FIELDS[:4]
 RESULTS = RESULTS_FIELDS[:2]
 FULL = CORE + STANDARD + RESULTS
 KEYS = ["date_start", "date_stop", "campaign_id", "adset_id", "ad_id"]
+STANDARD_A, STANDARD_B = STANDARD[:2], STANDARD[2:]
 FAILED = None  # what _run_job_to_completion returns for a job that did not build
 
 
@@ -63,9 +65,11 @@ FAILED = None  # what _run_job_to_completion returns for a job that did not buil
 def _fresh_process_state():
     AdsInsightStream._account_not_building = False
     AdsInsightStream._account_split_mode = False
+    AdsInsightStream._account_halved_parts = frozenset()
     yield
     AdsInsightStream._account_not_building = False
     AdsInsightStream._account_split_mode = False
+    AdsInsightStream._account_halved_parts = frozenset()
 
 
 @pytest.fixture(autouse=True)
@@ -222,18 +226,18 @@ class TestTheProbeOpensTheWayToSplitMode:
             {"name": "core", "columns": CORE, "report_run_id": "c-1"},
             {"name": "standard", "columns": KEYS + STANDARD, "report_run_id": "s-1"},
         ]
-        # Round 1: core builds, standard fails. Retry: standard fails again.
-        script = poll_script({"core": [built(), built()], "standard": [FAILED, FAILED]})
+        # Round 1: core builds, standard fails. Retry: standard comes back as two
+        # halves and both fail too.
+        script = poll_script({"core": [built(), built()], "standard": [FAILED], "standard-a": [FAILED], "standard-b": [FAILED]})
 
         with mock.patch.object(stream, "_poll_job_once", side_effect=script), \
-             mock.patch.object(stream, "_create_single_report", return_value="s-2") as create, \
+             mock.patch.object(stream, "_create_single_report", side_effect=["sa-1", "sb-1"]) as create, \
              mock.patch("tap_facebook.streams.ad_insights.user_logger") as user_log:
             rows = list(stream._process_report_batch([span_unit(parts)], FULL, 1))
 
-        # Only the failed part was recreated, once, with its own columns and shape.
-        assert create.call_count == 1
-        assert create.call_args.args[1] == KEYS + STANDARD
-        assert create.call_args.kwargs["until"] == UNTIL
+        # The failed part was recreated as halves, once, keeping the span shape.
+        assert [call.args[1] for call in create.call_args_list] == [KEYS + STANDARD_A, KEYS + STANDARD_B]
+        assert all(call.kwargs["until"] == UNTIL for call in create.call_args_list)
         # No probe, no per-day burst (on TJaE that was 98 creations and a #613):
         # the window is a failed date and the next window is tried as a span again.
         assert rows == []
@@ -243,7 +247,7 @@ class TestTheProbeOpensTheWayToSplitMode:
         assert stream._split_from is None
         assert AdsInsightStream._account_not_building is False
         message = user_log.error.call_args.args[0]
-        assert "built 1 of 2" in message and "standard" in message
+        assert "built 1 of 3" in message and "standard-a" in message and "standard-b" in message
 
     def test_a_source_with_only_core_columns_keeps_the_old_ladder(self):
         stream = make_stream()
@@ -278,7 +282,9 @@ class TestAPerSliceDateThatKeepsFailingIsSplitBeforeAnyColumnIsDropped:
             {"name": "core", "columns": CORE, "report_run_id": "c-1"},
             {"name": "standard", "columns": KEYS + STANDARD, "report_run_id": "s-1"},
         ]
-        script = poll_script({"core": [built()] * 3, "standard": [FAILED] * 3})
+        script = poll_script(
+            {"core": [built()] * 3, "standard": [FAILED], "standard-a": [FAILED] * 2, "standard-b": [FAILED] * 2}
+        )
 
         with mock.patch.object(stream, "_poll_job_once", side_effect=script), \
              mock.patch.object(stream, "_create_single_report", return_value="s-2"), \
@@ -411,7 +417,7 @@ class TestTheRowsOfThePartsAreCombined:
 
 
 class TestAPartThatDoesNotBuildFailsThePeriod:
-    def test_only_the_failed_part_is_recreated_and_the_rows_wait_for_it(self):
+    def test_only_the_failed_part_is_recreated_as_halves_and_the_rows_wait_for_it(self):
         stream = make_stream()
         stream._split_mode = True
         key = {"date_start": "2026-09-04", "date_stop": "2026-09-04", "campaign_id": "c", "adset_id": "s", "ad_id": "a"}
@@ -422,20 +428,24 @@ class TestAPartThatDoesNotBuildFailsThePeriod:
         script = poll_script(
             {
                 "core": [built([{**key, "spend": "1"}]), built([{**key, "spend": "1"}])],
-                "standard": [FAILED, built([{**key, "buying_type": "AUCTION"}])],
+                "standard": [FAILED],
+                "standard-a": [built([{**key, STANDARD_A[0]: "x"}])],
+                "standard-b": [built([{**key, STANDARD_B[1]: "y"}])],
             }
         )
 
         with mock.patch.object(stream, "_poll_job_once", side_effect=script) as poll, \
-             mock.patch.object(stream, "_create_single_report", return_value="s-2") as create:
+             mock.patch.object(stream, "_create_single_report", side_effect=["sa-1", "sb-1"]) as create:
             rows = list(stream._process_report_batch([slice_unit(parts)], FULL, 1))
 
-        assert create.call_count == 1
-        assert create.call_args.args[1] == KEYS + STANDARD
-        # Attempt 2 polls both parts again: the core job was built already but
-        # its rows were not emitted alone.
-        assert poll.call_count == 4
-        assert len(rows) == 1 and rows[0]["buying_type"] == "AUCTION" and rows[0]["spend"] == "1"
+        # The failed part came back as two halves; the core was not recreated.
+        assert [call.args[1] for call in create.call_args_list] == [KEYS + STANDARD_A, KEYS + STANDARD_B]
+        # Attempt 2 polls the core again too: its job was built already but its
+        # rows were not emitted alone.
+        assert poll.call_count == 5
+        assert len(rows) == 1
+        assert rows[0]["spend"] == "1" and rows[0][STANDARD_A[0]] == "x" and rows[0][STANDARD_B[1]] == "y"
+        assert AdsInsightStream._account_halved_parts == {"standard"}
 
     def test_a_part_that_never_builds_gives_the_date_up_without_a_partial_row(self):
         stream = make_stream()
@@ -444,10 +454,12 @@ class TestAPartThatDoesNotBuildFailsThePeriod:
             {"name": "core", "columns": CORE, "report_run_id": "c-1"},
             {"name": "standard", "columns": KEYS + STANDARD, "report_run_id": "s-1"},
         ]
-        script = poll_script({"core": [built()] * 3, "standard": [FAILED] * 3})
+        script = poll_script(
+            {"core": [built()] * 3, "standard": [FAILED], "standard-a": [FAILED] * 2, "standard-b": [FAILED] * 2}
+        )
 
         with mock.patch.object(stream, "_poll_job_once", side_effect=script), \
-             mock.patch.object(stream, "_create_single_report", return_value="s-2"), \
+             mock.patch.object(stream, "_create_single_report", return_value="s-2") as create, \
              mock.patch("tap_facebook.streams.ad_insights.user_logger"), \
              mock.patch("tap_facebook.streams.ad_insights.internal_logger"):
             rows = list(stream._process_report_batch([slice_unit(parts)], FULL, 1))
@@ -455,6 +467,58 @@ class TestAPartThatDoesNotBuildFailsThePeriod:
         assert rows == []
         assert stream._dates_failed == 1
         assert stream._rejected_columns == []
+        # Halves are cut once: attempt 1 creates the two halves, attempt 2
+        # recreates them as they are (4 creations, no quarters).
+        assert create.call_count == 4
+        assert {call.args[1][len(KEYS):][0] for call in create.call_args_list} == {STANDARD_A[0], STANDARD_B[0]}
+
+
+class TestARefusedPartIsCutInHalves:
+    def test_a_part_with_a_single_metric_is_recreated_as_it_is(self):
+        stream = make_stream()
+        parts = [
+            {"name": "core", "columns": CORE, "report_run_id": "c-1"},
+            {"name": "results", "columns": KEYS + RESULTS[:1], "report_run_id": None},
+        ]
+
+        with mock.patch.object(stream, "_create_single_report", return_value="r-2") as create:
+            assert stream._recreate_failed_parts(parts, START, 1, until=None) is True
+
+        assert [part["name"] for part in parts] == ["core", "results"]
+        assert create.call_args.args[1] == KEYS + RESULTS[:1]
+        assert AdsInsightStream._account_halved_parts == frozenset()
+
+    def test_the_next_windows_ask_for_the_halves_directly(self):
+        stream = make_stream()
+        stream._split_mode = True
+        AdsInsightStream._account_halved_parts = frozenset({"results"})
+
+        parts = dict(stream._report_parts(FULL))
+
+        assert list(parts) == ["core", "standard", "results-a", "results-b"]
+        assert parts["results-a"] == KEYS + RESULTS[:1] and parts["results-b"] == KEYS + RESULTS[1:]
+
+    def test_a_single_report_outside_split_mode_is_never_halved(self):
+        stream = make_stream()
+        parts = [{"name": "all", "columns": FULL, "report_run_id": None}]
+
+        with mock.patch.object(stream, "_create_single_report", return_value="r-2") as create:
+            assert stream._recreate_failed_parts(parts, START, 1, until=None) is True
+
+        assert create.call_args.args[1] == FULL and len(parts) == 1
+
+
+class TestFieldsFacebookDoesNotBuildAreNotRequested:
+    def test_total_card_view_stays_in_the_schema_but_leaves_the_request(self):
+        stream = make_stream()
+        assert "total_card_view" in FIELDS_NOT_BUILT_BY_FACEBOOK
+        assert "total_card_view" in stream.schema["properties"], "the column keeps existing, it arrives empty"
+        assert "total_card_view" not in stream._get_selected_columns()
+
+    def test_a_source_can_force_it_back(self):
+        tap = TapFacebook(config={**SAMPLE_CONFIG, "insights_included_fields": ["total_card_view"]})
+        stream = tap.streams["adsinsights"]
+        assert "total_card_view" in stream._get_selected_columns()
 
 
 class TestThePartsArePolledInTurn:
