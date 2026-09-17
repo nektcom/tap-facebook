@@ -497,6 +497,18 @@ PER_SLICE_RETRIES = 2
 SPLIT_MODE_TTL_DAYS = 7
 SPLIT_MODE_STATE_KEY = "insights_split_mode_since"
 
+# A part with more columns than this is itself cut in halves. STANDARD has 69
+# fields and on the first account tested (TJaE, 17/09/2026) it never left 0%
+# in 5 minutes, for 14 days or for 1 -- the only group that behaved like the
+# full 197-field report rather than failing outright.
+SPLIT_PART_MAX_COLUMNS = 40
+
+# Split mode never falls back to one report per day. On TJaE that fallback
+# meant 7 creations per day x 14 days = 98 creations in one go, which spent the
+# ad account's #613 budget before the second day was polled -- and the parts
+# that had failed for the 14-day span failed the same way for a single day.
+# A window whose parts do not all build is left for the next run instead.
+
 # Facebook says how long until the quota frees up, but that can be hours --
 # longer than a run should sit idle, since the next scheduled run would get
 # there sooner. Wait a little (a throttle is often a burst) and then spend the
@@ -659,6 +671,16 @@ class AdsInsightStream(FacebookSDKStream):
                 f"{APP_THROTTLE_RETRIES} retries; giving the window up for this run."
             )
             return
+        if self._split_mode:
+            user_logger.warning(
+                f"[{self.name}] Facebook is refusing further performance reports for this ad account: its "
+                "request limit is spent. The extraction was already requesting the metrics in smaller reports; "
+                "the rest of the period is left for the next scheduled run."
+            )
+            internal_logger.warning(
+                f"[{self.name}] Throttled in split mode; the remaining window is skipped for this run."
+            )
+            return
         user_logger.warning(
             f"[{self.name}] Facebook is still refusing performance reports for this ad account: its "
             "request limit is spent. The extraction already asks for the whole period in a single "
@@ -748,7 +770,14 @@ class AdsInsightStream(FacebookSDKStream):
         keys = self._split_key_fields()
         parts = [("core", [key for key in keys if key not in core] + core)]
         for label, group_columns in grouped.items():
-            parts.append((label, [key for key in keys if key not in group_columns] + group_columns))
+            pieces = -(-len(group_columns) // SPLIT_PART_MAX_COLUMNS)  # ceil
+            size = -(-len(group_columns) // pieces)
+            for number in range(pieces):
+                chunk = group_columns[number * size : (number + 1) * size]
+                if not chunk:
+                    continue
+                name = label if pieces == 1 else f"{label}-{number + 1}"
+                parts.append((name, [key for key in keys if key not in chunk] + chunk))
         return parts
 
     def _has_optional_columns(self, columns: list[str]) -> bool:
@@ -776,8 +805,10 @@ class AdsInsightStream(FacebookSDKStream):
             f"[{self.name}] Facebook could not build the performance report with all "
             f"{len(core) + sum(len(g) for g in grouped.values())} metrics at once for this ad account, but it "
             "builds the core metrics. The extraction continues by requesting the metrics in "
-            f"{1 + len(grouped)} smaller reports per period and combining them: same rows, same columns, it "
-            "only takes a few more requests. No action is needed on your side."
+            f"{len(self._report_parts(self._get_selected_columns()))} smaller reports per period and combining "
+            "them: same rows, same columns, it only takes a few more requests. Rows of a period are written once "
+            "all of its reports have built, so the row counter may stay at 0 for a while. No action is needed on "
+            "your side."
         )
         internal_logger.warning(
             f"[{self.name}] act_{self.config.get('account_id')}: entering split mode ({why}); parts = core "
@@ -1659,16 +1690,21 @@ class AdsInsightStream(FacebookSDKStream):
                         # Twice is enough. Whether the window is too big or the
                         # account is refusing every report is decided by one
                         # single-slice probe, not by a 13-30 report burst.
-                        self._leave_span(date_obj, report_date, columns, time_increment, until=span_until)
+                        self._leave_span(date_obj, report_date, columns, time_increment, until=span_until, parts=parts)
                         return
                     job_failures += 1
                     if job_failures >= CONSECUTIVE_FAILURES_BEFORE_BISECT:
-                        # The same date failed three times in a row: first ask for
-                        # it in parts (the usual cause is a report too heavy to
-                        # build), and only when already in parts hunt for a field.
+                        # The same date failed three times in a row: ask for it in
+                        # parts (the usual cause is a report too heavy to build).
+                        # Already in parts, no column hunt: each probe is another
+                        # creation against the account's budget, and a part that
+                        # does not build for a day did not build for the window
+                        # either -- the date is given up below.
                         if self._split_columns_failing_the_job(date_obj, columns):
                             return
-                        if self._drop_columns_failing_the_job(date_obj, columns, time_increment):
+                        if not self._split_mode and self._drop_columns_failing_the_job(
+                            date_obj, columns, time_increment
+                        ):
                             return
                     continue
 
@@ -1709,7 +1745,7 @@ class AdsInsightStream(FacebookSDKStream):
                 if span_until is not None:
                     # Same reasoning as a span job that never builds: probe one
                     # slice rather than write the whole range off or burst.
-                    self._leave_span(date_obj, report_date, columns, time_increment, until=span_until)
+                    self._leave_span(date_obj, report_date, columns, time_increment, until=span_until, parts=parts)
                     return
                 self._dates_failed += 1
                 msg = (
@@ -1745,21 +1781,42 @@ class AdsInsightStream(FacebookSDKStream):
     def _run_parts_to_completion(self, parts: list[dict], report_date: str) -> list[AdReportRun] | None:
         """Wait for every part of a period to build.
 
-        Every part is polled even after one has failed: the reports exist
-        already, so finding out which built is free, and only the failed ones
-        are recreated. Returns the built jobs in part order, or None when at
-        least one did not build (its report_run_id is cleared).
+        The parts are checked in turn, one status call each per round, so a
+        part that sits at 0% for five minutes does not hold up the others (on
+        TJaE, 17/09/2026, the parts were polled one after the other and each
+        attempt took 5+ minutes for the same verdict). Every part is polled
+        even after one has failed: the reports exist already, so finding out
+        which built is free, and only the failed ones are recreated. Returns
+        the built jobs in part order, or None when at least one did not build
+        (its report_run_id is cleared).
         """
-        jobs: list[AdReportRun] = []
-        failed: list[str] = []
-        for part in parts:
-            label = report_date if len(parts) == 1 else f"{report_date} [{part['name']}]"
-            job = self._run_job_to_completion(report_instance=AdReportRun(part["report_run_id"]), report_date=label)
+        if len(parts) == 1:
+            job = self._run_job_to_completion(
+                report_instance=AdReportRun(parts[0]["report_run_id"]), report_date=report_date
+            )
             if isinstance(job, AdReportRun):
-                jobs.append(job)
-            else:
-                part["report_run_id"] = None
-                failed.append(part["name"])
+                return [job]
+            parts[0]["report_run_id"] = None
+            return None
+
+        pending = {
+            index: self._new_poll_state(AdReportRun(part["report_run_id"]), f"{report_date} [{part['name']}]")
+            for index, part in enumerate(parts)
+        }
+        jobs: dict[int, AdReportRun] = {}
+        failed: list[str] = []
+        while pending:
+            for index in list(pending):
+                outcome, job = self._poll_job_once(pending[index])
+                if outcome == "completed":
+                    jobs[index] = job
+                    del pending[index]
+                elif outcome == "failed":
+                    parts[index]["report_run_id"] = None
+                    failed.append(parts[index]["name"])
+                    del pending[index]
+            if pending:
+                time.sleep(max(state["sleep"] for state in pending.values()))
         if failed:
             if len(parts) > 1:
                 internal_logger.warning(
@@ -1767,7 +1824,7 @@ class AdsInsightStream(FacebookSDKStream):
                     f"{', '.join(failed)}. The period is not emitted until every part has built."
                 )
             return None
-        return jobs
+        return [jobs[index] for index in range(len(parts))]
 
     def _merge_part_results(self, parts: list[dict], jobs: list[AdReportRun], report_date: str) -> list[dict]:
         """Read the built report(s) of a period and combine them into one row per key.
@@ -1828,6 +1885,81 @@ class AdsInsightStream(FacebookSDKStream):
         )
         return True
 
+    def _new_poll_state(self, report_instance: AdReportRun, report_date: str, *, quiet: bool = False) -> dict:
+        """Everything one async job needs between two status checks."""
+        return {
+            "instance": report_instance,
+            "report_date": report_date,
+            "channel": internal_logger if quiet else user_logger,
+            "start": time.time(),
+            "poll_failures": 0,
+            "sleep": POLL_JOB_SLEEP_TIME,
+        }
+
+    def _poll_job_once(self, state: dict) -> tuple[str, th.Any]:
+        """One status check of an async job.
+
+        Returns ("completed", job), ("failed", None) or ("pending", None);
+        `state["sleep"]` says how long to wait before the next check. Kept as
+        a single step so several jobs can be checked in turn (split mode)
+        instead of each one holding the line for up to 5 minutes.
+        """
+        channel = state["channel"]
+        report_date = state["report_date"]
+        max_wait = self.config.get("insights_max_wait_to_finish_seconds", DEFAULT_INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS)
+        duration = time.time() - state["start"]
+        try:
+            job = state["instance"].api_get()
+            status = job[AdReportRun.Field.async_status]
+            percent_complete = job[AdReportRun.Field.async_percent_completion]
+            job_id = job["id"]
+        except FacebookRequestError:
+            # Structured API errors (rate limits, auth) keep their existing
+            # handling upstream in get_records.
+            raise
+        except Exception as poll_error:
+            state["poll_failures"] += 1
+            if state["poll_failures"] >= MAX_CONSECUTIVE_POLL_FAILURES:
+                channel.error(
+                    f"[{self.name}] Could not check the insights report status for {report_date} "
+                    "after several attempts. The report will be retried from scratch."
+                )
+                internal_logger.error(
+                    f"[{self.name}] Polling api_get() failed {state['poll_failures']}x in a row "
+                    f"for {report_date}; giving up on this job instance: {poll_error!r}",
+                    exc_info=True,
+                )
+                return "failed", None
+            internal_logger.warning(
+                f"[{self.name}] Unreadable response while polling insights job for {report_date} "
+                f"(attempt {state['poll_failures']}/{MAX_CONSECUTIVE_POLL_FAILURES}): {poll_error!r}",
+                exc_info=True,
+            )
+            state["sleep"] = min(POLL_JOB_SLEEP_TIME * state["poll_failures"], 60)
+            return "pending", None
+        state["poll_failures"] = 0
+        state["sleep"] = POLL_JOB_SLEEP_TIME
+        channel.info(f"[{self.name}] ID: {job_id} - {status} for {report_date} - {percent_complete}% done. ")
+
+        if status == "Job Completed":
+            return "completed", job
+        if status == "Job Failed":
+            self._record_job_failure(job, job_id, report_date, channel)
+            return "failed", None
+        if duration > INSIGHTS_MAX_WAIT_TO_START_SECONDS and percent_complete == 0:
+            channel.error(
+                f"[{self.name}] Insights job {job_id} did not start after {duration:.0f} seconds for {report_date}. "
+                + JOB_STALE_ERROR_MESSAGE
+            )
+            return "failed", None
+        if duration > max_wait:
+            channel.error(
+                f"[{self.name}] Insights job {job_id} did not complete after {max_wait}s for {report_date}. "
+                f"To fix this, increase 'insights_max_wait_to_finish_seconds' in the tap config (current: {max_wait}s)."
+            )
+            return "failed", None
+        return "pending", None
+
     def _run_job_to_completion(
         self,
         report_instance: AdReportRun,
@@ -1835,68 +1967,16 @@ class AdsInsightStream(FacebookSDKStream):
         *,
         quiet: bool = False,
     ) -> th.Any:
-        status = None
-        time_start = time.time()
-        max_wait = self.config.get("insights_max_wait_to_finish_seconds", DEFAULT_INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS)
-        channel = internal_logger if quiet else user_logger
-        consecutive_poll_failures = 0
-
-        while status != "Job Completed":
-            duration = time.time() - time_start
-            try:
-                job = report_instance.api_get()
-                status = job[AdReportRun.Field.async_status]
-                percent_complete = job[AdReportRun.Field.async_percent_completion]
-                job_id = job["id"]
-            except FacebookRequestError:
-                # Structured API errors (rate limits, auth) keep their existing
-                # handling upstream in get_records.
-                raise
-            except Exception as poll_error:
-                consecutive_poll_failures += 1
-                if consecutive_poll_failures >= MAX_CONSECUTIVE_POLL_FAILURES:
-                    channel.error(
-                        f"[{self.name}] Could not check the insights report status for {report_date} "
-                        "after several attempts. The report will be retried from scratch."
-                    )
-                    internal_logger.error(
-                        f"[{self.name}] Polling api_get() failed {consecutive_poll_failures}x in a row "
-                        f"for {report_date}; giving up on this job instance: {poll_error!r}",
-                        exc_info=True,
-                    )
-                    return None
-                internal_logger.warning(
-                    f"[{self.name}] Unreadable response while polling insights job for {report_date} "
-                    f"(attempt {consecutive_poll_failures}/{MAX_CONSECUTIVE_POLL_FAILURES}): {poll_error!r}",
-                    exc_info=True,
-                )
-                time.sleep(min(POLL_JOB_SLEEP_TIME * consecutive_poll_failures, 60))
-                continue
-            consecutive_poll_failures = 0
-            channel.info(f"[{self.name}] ID: {job_id} - {status} for {report_date} - {percent_complete}% done. ")
-
-            if status == "Job Completed":
+        """Wait for one async job; returns the built job, or None when it did not build."""
+        state = self._new_poll_state(report_instance, report_date, quiet=quiet)
+        while True:
+            outcome, job = self._poll_job_once(state)
+            if outcome == "completed":
                 return job
-            if status == "Job Failed":
-                self._record_job_failure(job, job_id, report_date, channel)
-                return
-            if duration > INSIGHTS_MAX_WAIT_TO_START_SECONDS and percent_complete == 0:
-                channel.error(
-                    f"[{self.name}] Insights job {job_id} did not start after {duration:.0f} seconds for {report_date}. "
-                    + JOB_STALE_ERROR_MESSAGE
-                )
-                return
-            if duration > max_wait:
-                channel.error(
-                    f"[{self.name}] Insights job {job_id} did not complete after {max_wait}s for {report_date}. "
-                    f"To fix this, increase 'insights_max_wait_to_finish_seconds' in the tap config (current: {max_wait}s)."
-                )
-                return
-
-            internal_logger.info(f"[{self.name}] Sleeping for {POLL_JOB_SLEEP_TIME} seconds until job is done")
-            time.sleep(POLL_JOB_SLEEP_TIME)
-        user_logger.error(f"[{self.name}] Job failed to complete for unknown reason")
-        sys.exit(1)
+            if outcome == "failed":
+                return None
+            internal_logger.info(f"[{self.name}] Sleeping for {state['sleep']} seconds until job is done")
+            time.sleep(state["sleep"])
 
     def _record_job_failure(self, job: th.Any, job_id: str, report_date: str, channel: th.Any) -> None:
         """Log why Facebook failed the job, in Facebook's own words.
@@ -1952,6 +2032,7 @@ class AdsInsightStream(FacebookSDKStream):
         time_increment: int | str,
         *,
         until: pendulum.Date | None = None,
+        parts: list[dict] | None = None,
     ) -> None:
         """Decide, with one single-slice probe, whether per-slice reports are worth it.
 
@@ -1972,6 +2053,12 @@ class AdsInsightStream(FacebookSDKStream):
         """
         if self._throttled:
             self._throttled_from = date_obj
+            return
+
+        if self._split_mode:
+            # Already in parts and some of them did not build twice. No probe
+            # and no per-day fallback: see SPLIT_PART_MAX_COLUMNS above.
+            self._give_up_on_split_window(report_label, parts or [])
             return
 
         probe_date = until or date_obj
@@ -2022,6 +2109,28 @@ class AdsInsightStream(FacebookSDKStream):
 
         # The account builds single-slice reports: the span really was too big.
         self._give_up_on_span(date_obj, report_label)
+
+    def _give_up_on_split_window(self, report_label: str, parts: list[dict]) -> None:
+        """Leave a window whose parts did not all build for the next run.
+
+        The rows of the parts that did build are not emitted: the rule is that
+        a row is written whole or not at all. The window counts as a failed
+        date so the floor at the end of the run can tell this apart from an
+        account that had nothing to report.
+        """
+        self._dates_failed += 1
+        built = [part["name"] for part in parts if part.get("report_run_id")]
+        missing = [part["name"] for part in parts if not part.get("report_run_id")]
+        user_logger.error(
+            f"[{self.name}] Facebook built {len(built)} of {len(parts)} smaller reports covering {report_label}, "
+            f"but not: {', '.join(missing) or 'unknown'}. The period was left for the next scheduled run rather "
+            "than written with those columns empty. Asking for it one day at a time would only spend the "
+            "account's request limit on reports that fail the same way."
+        )
+        internal_logger.error(
+            f"[{self.name}] act_{self.config.get('account_id')}: split window {report_label} given up after "
+            f"{SPAN_RETRIES + 1} attempts; built={built} missing={missing}; last job error: {self._last_job_error!r}."
+        )
 
     def _mark_account_not_building(self, report_label: str, why: str) -> None:
         """Stop this stream, and every later insights stream of the run, cheaply.
@@ -2194,7 +2303,9 @@ class AdsInsightStream(FacebookSDKStream):
                 if not batch_reports:
                     if self._throttled:
                         # The window is already one request; there is no smaller
-                        # shape left to ask for.
+                        # shape left to ask for. A refused window is a failed
+                        # window, not an empty one.
+                        self._dates_failed += 1
                         self._warn_throttle_is_unrecoverable()
                     # Nothing queued: skip the whole span this batch just tried,
                     # not a single date -- otherwise every date is re-requested
@@ -2237,6 +2348,11 @@ class AdsInsightStream(FacebookSDKStream):
                     # retried forever.
                     resume_from = self._throttled_from
                     self._throttled_from = None
+                    # Reports had been queued for this window, so without this
+                    # the floor would read "queued, nothing failed, no rows" as an
+                    # account with nothing to report and end the run green
+                    # (TJaE, 17/09/2026).
+                    self._dates_failed += 1
                     self._warn_throttle_is_unrecoverable()
                     attempted = SPAN_MAX_SLICES if self._span_mode else batch_size
                     report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
