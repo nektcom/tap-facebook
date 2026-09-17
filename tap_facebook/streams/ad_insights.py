@@ -477,6 +477,26 @@ SPAN_RETRIES = 1
 # the account throttled (NEKT-5249).
 PER_SLICE_RETRIES = 2
 
+# "Service temporarily unavailable" (2/1504044) on an async insights job means
+# the report is too heavy for Facebook to build -- fields x limit x breakdowns x
+# period against the account's data volume -- not that the account is blocked
+# (Meta support, bug 1490232869529657, 16/09/2026). On the same account and
+# day, the full field set failed in seconds even with limit=25 while the 51
+# BASIC_FIELDS built fine, so the field set is the lever, not the page size.
+#
+# Split mode is the fallback for exactly that: the same period is requested as
+# several smaller reports (the core metrics, then one per enabled optional
+# group), each carrying the join keys, and the rows are combined before they
+# are emitted -- same rows, same columns, same table. It is entered only after
+# the full report has failed and the core metrics alone have built, so an
+# account that builds the full report keeps paying one creation per period.
+# The verdict is remembered in the stream state for this long, so the next runs
+# do not spend two heavy failures plus a probe to rediscover it -- those failed
+# heavy requests count against the per-account #613 limit too. After that the
+# full report is tried again, in case Facebook's side has changed.
+SPLIT_MODE_TTL_DAYS = 7
+SPLIT_MODE_STATE_KEY = "insights_split_mode_since"
+
 # Facebook says how long until the quota frees up, but that can be hours --
 # longer than a run should sit idle, since the next scheduled run would get
 # there sooner. Wait a little (a throttle is often a burst) and then spend the
@@ -512,6 +532,11 @@ class AdsInsightStream(FacebookSDKStream):
     # report for the ad account. Every other insights stream of the same run
     # checks it before spending calls of its own on the same refusal.
     _account_not_building: bool = False
+
+    # Same scope: once one insights stream learns that this ad account only
+    # builds the report in parts, the other insights streams of the run start
+    # in parts too instead of failing the full report twice each.
+    _account_split_mode: bool = False
 
     @property
     def effective_granularity(self) -> str:
@@ -566,6 +591,14 @@ class AdsInsightStream(FacebookSDKStream):
         # Set when report creation is refused for quota while a batch is being
         # processed, so the caller can resume that window as a single report.
         self._throttled_from: pendulum.Date | None = None
+        # Split mode: the period is requested as several smaller reports (see
+        # SPLIT_MODE_TTL_DAYS). Off until the full report has failed and the
+        # core metrics alone have built, or until a previous run's verdict is
+        # read back from the state. `_split_from` says where to pick the sync
+        # back up once the mode was entered mid-batch.
+        self._split_mode = False
+        self._split_from: pendulum.Date | None = None
+        self._sync_context: dict | None = None
 
     def _note_throttled(self, fb_err: FacebookRequestError, current_date: pendulum.Date) -> None:
         """Record that Facebook refused a report because the quota is spent.
@@ -654,6 +687,141 @@ class AdsInsightStream(FacebookSDKStream):
         internal_logger.warning(
             f"[{self.name}] Span report for {report_label} failed to complete; span mode disabled for "
             f"the rest of the run, resuming per-slice from {resume_from.to_date_string()}."
+        )
+
+    # ---- split mode: the same period as several smaller reports ------------
+
+    def _split_key_fields(self) -> list[str]:
+        """Columns every part of a split report carries so its rows can be joined.
+
+        They are the inputs of `_generate_hash_id` for this level (the breakdown
+        columns come back with every report on their own). Requesting a key the
+        level does not have -- ad_id on a campaign report -- is a rejected
+        request, so the list follows the level.
+        """
+        keys = ["date_start", "date_stop", "campaign_id"]
+        if self.report_level == "adset":
+            keys.append("adset_id")
+        elif self.report_level == "ad":
+            keys.extend(["adset_id", "ad_id"])
+        return keys
+
+    def _partition_columns(self, columns: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+        """Split the requested columns into the core set and the optional groups.
+
+        Returns (core, {group label: columns}). A column that belongs to no
+        group stays with the core: it is not what makes a report heavy, and a
+        part of one unknown column is not worth a creation of its own.
+        """
+        basic_set = set(BASIC_FIELDS)
+        core: list[str] = []
+        grouped: dict[str, list[str]] = {}
+        for column in columns:
+            if column in basic_set:
+                core.append(column)
+                continue
+            owner = next((key for key, group in self.OPTIONAL_FIELD_GROUPS.items() if column in group), None)
+            if owner is None:
+                core.append(column)
+                continue
+            label = owner.removeprefix("include_insights_").removesuffix("_fields")
+            grouped.setdefault(label, []).append(column)
+        return core, grouped
+
+    def _core_columns(self, columns: list[str]) -> list[str]:
+        """The core (BASIC_FIELDS) subset of `columns`, plus the join keys."""
+        core, _ = self._partition_columns(columns)
+        keys = [key for key in self._split_key_fields() if key not in core]
+        return keys + core
+
+    def _report_parts(self, columns: list[str]) -> list[tuple[str, list[str]]]:
+        """How the columns are spread over reports for one period.
+
+        Outside split mode this is one report with every column. In split
+        mode the core metrics come first (their rows are the base every other
+        part is merged into) and each enabled optional group is its own
+        report, all sharing the join keys.
+        """
+        core, grouped = self._partition_columns(columns)
+        if not self._split_mode or not grouped:
+            return [("all", list(columns))]
+        keys = self._split_key_fields()
+        parts = [("core", [key for key in keys if key not in core] + core)]
+        for label, group_columns in grouped.items():
+            parts.append((label, [key for key in keys if key not in group_columns] + group_columns))
+        return parts
+
+    def _has_optional_columns(self, columns: list[str]) -> bool:
+        _, grouped = self._partition_columns(columns)
+        return bool(grouped)
+
+    def _enter_split_mode(self, why: str, *, resume_from: pendulum.Date) -> None:
+        """Switch this run -- and the next ones -- to requesting the period in parts.
+
+        Recorded on the class for the other insights streams of this process
+        and in the stream state for the next runs (see SPLIT_MODE_TTL_DAYS).
+        """
+        self._split_mode = True
+        self._split_from = resume_from
+        AdsInsightStream._account_split_mode = True
+        try:
+            state = self.get_context_state(self._sync_context)
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not record the split-mode verdict in the state.", exc_info=True)
+        else:
+            state[SPLIT_MODE_STATE_KEY] = pendulum.today().to_date_string()
+
+        core, grouped = self._partition_columns(self._get_selected_columns())
+        user_logger.warning(
+            f"[{self.name}] Facebook could not build the performance report with all "
+            f"{len(core) + sum(len(g) for g in grouped.values())} metrics at once for this ad account, but it "
+            "builds the core metrics. The extraction continues by requesting the metrics in "
+            f"{1 + len(grouped)} smaller reports per period and combining them: same rows, same columns, it "
+            "only takes a few more requests. No action is needed on your side."
+        )
+        internal_logger.warning(
+            f"[{self.name}] act_{self.config.get('account_id')}: entering split mode ({why}); parts = core "
+            f"({len(core)}) + {', '.join(f'{label} ({len(cols)})' for label, cols in grouped.items())}; "
+            f"resuming from {resume_from.to_date_string()}; remembered for {SPLIT_MODE_TTL_DAYS} days."
+        )
+
+    def _restore_split_mode(self, context: dict | None) -> None:
+        """Start in split mode when this process or a recent run already found it necessary."""
+        if AdsInsightStream._account_split_mode:
+            self._split_mode = True
+            internal_logger.info(
+                f"[{self.name}] Starting in split mode: an earlier stream of this run found the account "
+                "only builds the report in parts."
+            )
+            return
+        try:
+            state = self.get_context_state(context)
+        except Exception:  # noqa: BLE001
+            internal_logger.warning(f"[{self.name}] Could not read the split-mode marker from the state.", exc_info=True)
+            return
+        since = state.get(SPLIT_MODE_STATE_KEY)
+        if not since:
+            return
+        try:
+            since_date = pendulum.parse(str(since)).date()
+        except Exception:  # noqa: BLE001
+            state.pop(SPLIT_MODE_STATE_KEY, None)
+            return
+        if since_date.add(days=SPLIT_MODE_TTL_DAYS) < pendulum.today().date():
+            state.pop(SPLIT_MODE_STATE_KEY, None)
+            internal_logger.info(
+                f"[{self.name}] Split-mode marker from {since_date.to_date_string()} expired after "
+                f"{SPLIT_MODE_TTL_DAYS} days; trying the full report again."
+            )
+            return
+        self._split_mode = True
+        AdsInsightStream._account_split_mode = True
+        user_logger.info(
+            f"[{self.name}] Requesting the metrics in smaller reports per period, as in the previous runs "
+            f"(since {since_date.to_date_string()})."
+        )
+        internal_logger.info(
+            f"[{self.name}] Starting in split mode from the state marker ({since_date.to_date_string()})."
         )
 
     def _wait_out_throttle(self) -> None:
@@ -1091,52 +1259,91 @@ class AdsInsightStream(FacebookSDKStream):
                 next_date = self._advance_batch(current_date, time_increment, SPAN_MAX_SLICES, end_date)
                 span_until = min(next_date.subtract(days=1), end_date)
 
-            params = {
-                "level": self.report_level,
-                "action_breakdowns": self.config.get("report_definition", {}).get("action_breakdowns"),
-                "action_report_time": self.config.get("report_definition", {}).get("action_report_time"),
-                "breakdowns": self.report_breakdowns,
-                "fields": columns,
-                "time_increment": time_increment,
-                "limit": 100,
-                "action_attribution_windows": [
-                    self.config.get("report_definition", {}).get("action_attribution_windows_view"),
-                    self.config.get("report_definition", {}).get("action_attribution_windows_click"),
-                ],
-                "time_range": self._get_time_range(current_date, span_until),
-            }
             report_label = (
                 f"{current_date.to_date_string()} to {span_until.to_date_string()}"
                 if span_until is not None
                 else current_date.to_date_string()
             )
 
+            parts = self._queue_report_parts(current_date, span_until, report_label, columns, time_increment)
+            if self._rejected_columns or self._throttled:
+                # Either would refuse every remaining date of the batch the same
+                # way; the caller decides how to resume.
+                break
+            if parts:
+                batch_reports.append(
+                    {
+                        "report_run_id": parts[0]["report_run_id"],
+                        "parts": parts,
+                        "date": report_label,
+                        "date_obj": current_date,
+                        "until_obj": span_until,
+                        "next_date": next_date,
+                    }
+                )
+
+            current_date = next_date
+
+        return batch_reports
+
+    def _report_params(self, columns: list[str], time_increment: int | str, time_range: dict) -> dict:
+        return {
+            "level": self.report_level,
+            "action_breakdowns": self.config.get("report_definition", {}).get("action_breakdowns"),
+            "action_report_time": self.config.get("report_definition", {}).get("action_report_time"),
+            "breakdowns": self.report_breakdowns,
+            "fields": columns,
+            "time_increment": time_increment,
+            "limit": 100,
+            "action_attribution_windows": [
+                self.config.get("report_definition", {}).get("action_attribution_windows_view"),
+                self.config.get("report_definition", {}).get("action_attribution_windows_click"),
+            ],
+            "time_range": time_range,
+        }
+
+    def _queue_report_parts(
+        self,
+        current_date: pendulum.Date,
+        span_until: pendulum.Date | None,
+        report_label: str,
+        columns: list[str],
+        time_increment: int | str,
+    ) -> list[dict]:
+        """Create the report(s) that cover one period: one, or one per part in split mode.
+
+        Returns the created parts, or an empty list when the period could not
+        be queued. A rejected `fields` param or a spent quota is recorded on
+        the stream (`_rejected_columns`, `_throttled`) for the caller to act on.
+        A part that fails to be created for any other reason makes the whole
+        period unavailable for this batch: half a period is not emitted.
+        """
+        parts = self._report_parts(columns)
+        time_range = self._get_time_range(current_date, span_until)
+        created: list[dict] = []
+
+        for part_name, part_columns in parts:
+            part_label = report_label if len(parts) == 1 else f"{report_label} [{part_name}]"
             try:
-                response = self._request_report_creation(params, report_label)
+                response = self._request_report_creation(
+                    self._report_params(part_columns, time_increment, time_range), part_label
+                )
                 self._check_facebook_api_usage(headers=response._headers)
-                if response.status() == HTTPStatus.OK:
-                    report_run_id = response.json()["report_run_id"]
-                    batch_reports.append(
-                        {
-                            "report_run_id": report_run_id,
-                            "date": report_label,
-                            "date_obj": current_date,
-                            "until_obj": span_until,
-                            "next_date": next_date,
-                        }
-                    )
-                    user_logger.info(f"[{self.name}] Queued report for {report_label}")
-                else:
-                    user_logger.warning(f"[{self.name}] Failed to queue report for {report_label}")
+                if response.status() != HTTPStatus.OK:
+                    user_logger.warning(f"[{self.name}] Failed to queue report for {part_label}")
                     internal_logger.warning(
-                        f"[{self.name}] Report creation for {report_label} returned "
+                        f"[{self.name}] Report creation for {part_label} returned "
                         f"HTTP {response.status()} instead of 200; no report_run_id was issued."
                     )
+                    return []
+                created.append(
+                    {"name": part_name, "columns": part_columns, "report_run_id": response.json()["report_run_id"]}
+                )
 
             except FacebookRequestError as fb_err:
                 message = fb_err.api_error_message() or str(fb_err)
                 rejected = (
-                    _columns_named_in_error(message, columns)
+                    _columns_named_in_error(message, part_columns)
                     if fb_err.api_error_code() == FIELDS_PARAM_ERROR_CODE
                     else []
                 )
@@ -1149,10 +1356,10 @@ class AdsInsightStream(FacebookSDKStream):
                     self._rejected_columns = rejected
                     internal_logger.warning(
                         f"[{self.name}] Graph API rejected the fields param for "
-                        f"{current_date.to_date_string()} (code {fb_err.api_error_code()}): {message}. "
+                        f"{part_label} (code {fb_err.api_error_code()}): {message}. "
                         f"Dropping {len(rejected)} column(s) and retrying the batch: {', '.join(rejected)}"
                     )
-                    break
+                    return []
 
                 if fb_err.api_error_code() in THROTTLE_ERROR_CODES:
                     # Out of quota. Every remaining date in this batch is another
@@ -1160,35 +1367,40 @@ class AdsInsightStream(FacebookSDKStream):
                     # way, so stop here and let the caller ask for the window in
                     # one report instead.
                     self._note_throttled(fb_err, current_date)
-                    break
+                    return []
 
-                user_logger.warning(
-                    f"[{self.name}] Error queueing report for {report_label}: {fb_err.api_error_message()}"
-                )
+                user_logger.warning(f"[{self.name}] Error queueing report for {part_label}: {fb_err.api_error_message()}")
                 internal_logger.warning(
-                    f"[{self.name}] Report creation failed for {report_label} "
+                    f"[{self.name}] Report creation failed for {part_label} "
                     f"(code {fb_err.api_error_code()}, subcode {fb_err.api_error_subcode()}, "
                     f"HTTP {fb_err.http_status()}): {message}",
                     exc_info=True,
                 )
+                return []
             except requests.exceptions.RequestException as net_err:
                 # The retry inside _request_report_creation did not get through.
                 # One unreachable date is not a reason to kill the run: the floor
                 # at the end decides whether nothing at all was extracted.
                 user_logger.warning(
-                    f"[{self.name}] Could not reach Facebook to request the report for {report_label}; "
+                    f"[{self.name}] Could not reach Facebook to request the report for {part_label}; "
                     "the date was skipped for this run."
                 )
                 internal_logger.error(
-                    f"[{self.name}] Report creation for {report_label} failed on the connection after "
+                    f"[{self.name}] Report creation for {part_label} failed on the connection after "
                     f"retrying: {net_err!r}",
                     exc_info=True,
                 )
                 self._dates_failed += 1
+                return []
 
-            current_date = next_date
-
-        return batch_reports
+        if len(created) == 1:
+            user_logger.info(f"[{self.name}] Queued report for {report_label}")
+        else:
+            user_logger.info(
+                f"[{self.name}] Queued {len(created)} reports for {report_label} "
+                f"({', '.join(part['name'] for part in created)})"
+            )
+        return created
 
     def _create_single_report(
         self,
@@ -1362,11 +1574,22 @@ class AdsInsightStream(FacebookSDKStream):
             )
             return False
         if not dropped:
-            # Not one field, or not a field at all. Fall back to the contract set
-            # once, so the run still delivers the core metrics for every date.
+            # Not one field, or not a field at all.
             optional = [column for column in columns if column not in set(BASIC_FIELDS)]
             if not optional:
                 return False
+            if self._split_mode:
+                # The date is already being asked for in parts and one part still
+                # does not build for no single field. Emitting the row without
+                # that part's columns would write a silently incomplete row; let
+                # the date fail instead, the next run tries again.
+                internal_logger.warning(
+                    f"[{self.name}] Could not isolate a single column for {date_obj.to_date_string()} while "
+                    "already in split mode; the date is given up rather than emitted with empty columns."
+                )
+                return False
+            # Fall back to the contract set once, so the run still delivers the
+            # core metrics for every date.
             dropped = optional
             internal_logger.warning(
                 f"[{self.name}] Could not isolate a single column for {date_obj.to_date_string()}; "
@@ -1399,10 +1622,15 @@ class AdsInsightStream(FacebookSDKStream):
         max_retries = PER_SLICE_RETRIES
 
         for report_info in batch_reports:
-            report_run_id = report_info["report_run_id"]
             report_date = report_info["date"]
             date_obj = report_info["date_obj"]
             span_until = report_info.get("until_obj")
+            # One report per period by default; several in split mode. A part
+            # whose job fails has its report_run_id cleared and is the only one
+            # recreated on the next attempt.
+            parts: list[dict] = report_info.get("parts") or [
+                {"name": "all", "columns": columns, "report_run_id": report_info["report_run_id"]}
+            ]
             job_failures = 0
 
             for attempt in range(max_retries + 1):
@@ -1411,8 +1639,7 @@ class AdsInsightStream(FacebookSDKStream):
                         f"[{self.name}] Retrying job for {report_date} (attempt {attempt}/{max_retries}), waiting 60s..."
                     )
                     time.sleep(60)
-                    report_run_id = self._create_single_report(date_obj, columns, time_increment, until=span_until)
-                    if not report_run_id:
+                    if not self._recreate_failed_parts(parts, date_obj, time_increment, until=span_until):
                         if self._throttled:
                             # The ad account's budget is spent. The nine attempts
                             # left here, and every later date in this batch, are
@@ -1422,11 +1649,8 @@ class AdsInsightStream(FacebookSDKStream):
                             return
                         continue
 
-                job = self._run_job_to_completion(
-                    report_instance=AdReportRun(report_run_id),
-                    report_date=report_date,
-                )
-                if not isinstance(job, AdReportRun):
+                jobs = self._run_parts_to_completion(parts, report_date)
+                if jobs is None:
                     if span_until is not None:
                         if attempt < SPAN_RETRIES and not self._throttled:
                             # One more try before giving the shape up: most job
@@ -1438,21 +1662,18 @@ class AdsInsightStream(FacebookSDKStream):
                         self._leave_span(date_obj, report_date, columns, time_increment, until=span_until)
                         return
                     job_failures += 1
-                    if job_failures >= CONSECUTIVE_FAILURES_BEFORE_BISECT and self._drop_columns_failing_the_job(
-                        date_obj, columns, time_increment
-                    ):
-                        return
+                    if job_failures >= CONSECUTIVE_FAILURES_BEFORE_BISECT:
+                        # The same date failed three times in a row: first ask for
+                        # it in parts (the usual cause is a report too heavy to
+                        # build), and only when already in parts hunt for a field.
+                        if self._split_columns_failing_the_job(date_obj, columns):
+                            return
+                        if self._drop_columns_failing_the_job(date_obj, columns, time_increment):
+                            return
                     continue
 
                 try:
-                    records = []
-                    for obj in job.get_result():
-                        if isinstance(obj, AdsInsights):
-                            obj["id"] = self._generate_hash_id(adinsight=obj, report_breakdowns=self.report_breakdowns)
-                            records.append(obj.export_all_data())
-                        else:
-                            user_logger.warning(f"[{self.name}] Unexpected result type for {report_date}")
-                    yield from records
+                    yield from self._merge_part_results(parts, jobs, report_date)
                     break
                 except FacebookRequestError as fb_err:
                     if self._record_columns_refused_while_reading(fb_err, columns, report_date, date_obj):
@@ -1463,8 +1684,8 @@ class AdsInsightStream(FacebookSDKStream):
                         f"{fb_err.api_error_message()}. Retrying..."
                     )
                     internal_logger.warning(
-                        f"[{self.name}] Reading report {report_run_id} for {report_date} failed "
-                        f"(code {fb_err.api_error_code()}, HTTP {fb_err.http_status()}): "
+                        f"[{self.name}] Reading report(s) {[part['report_run_id'] for part in parts]} for "
+                        f"{report_date} failed (code {fb_err.api_error_code()}, HTTP {fb_err.http_status()}): "
                         f"{fb_err.api_error_message()}",
                         exc_info=True,
                     )
@@ -1475,7 +1696,8 @@ class AdsInsightStream(FacebookSDKStream):
             else:
                 # End of the ladder for this date:
                 #   job fails -> retry
-                #   -> CONSECUTIVE_FAILURES_BEFORE_BISECT in a row: bisect, drop the
+                #   -> CONSECUTIVE_FAILURES_BEFORE_BISECT in a row: ask for the date
+                #      in parts (split mode); already in parts: bisect, drop the
                 #      offending column, resume the date with a narrower set
                 #   -> still failing after max_retries: give up on the date (here)
                 #      -> fail_on_job_error=True: stop the run now (strict; the
@@ -1497,6 +1719,114 @@ class AdsInsightStream(FacebookSDKStream):
                 user_logger.error(msg)
                 if fail_on_error:
                     sys.exit(1)
+
+    def _recreate_failed_parts(
+        self,
+        parts: list[dict],
+        date_obj: pendulum.Date,
+        time_increment: int | str,
+        *,
+        until: pendulum.Date | None,
+    ) -> bool:
+        """Recreate the report of every part whose job did not build.
+
+        Returns False when one of them could not be created; `_throttled` then
+        says whether that was the quota.
+        """
+        for part in parts:
+            if part.get("report_run_id"):
+                continue
+            report_run_id = self._create_single_report(date_obj, part["columns"], time_increment, until=until)
+            if not report_run_id:
+                return False
+            part["report_run_id"] = report_run_id
+        return True
+
+    def _run_parts_to_completion(self, parts: list[dict], report_date: str) -> list[AdReportRun] | None:
+        """Wait for every part of a period to build.
+
+        Every part is polled even after one has failed: the reports exist
+        already, so finding out which built is free, and only the failed ones
+        are recreated. Returns the built jobs in part order, or None when at
+        least one did not build (its report_run_id is cleared).
+        """
+        jobs: list[AdReportRun] = []
+        failed: list[str] = []
+        for part in parts:
+            label = report_date if len(parts) == 1 else f"{report_date} [{part['name']}]"
+            job = self._run_job_to_completion(report_instance=AdReportRun(part["report_run_id"]), report_date=label)
+            if isinstance(job, AdReportRun):
+                jobs.append(job)
+            else:
+                part["report_run_id"] = None
+                failed.append(part["name"])
+        if failed:
+            if len(parts) > 1:
+                internal_logger.warning(
+                    f"[{self.name}] {len(failed)} of {len(parts)} part(s) did not build for {report_date}: "
+                    f"{', '.join(failed)}. The period is not emitted until every part has built."
+                )
+            return None
+        return jobs
+
+    def _merge_part_results(self, parts: list[dict], jobs: list[AdReportRun], report_date: str) -> list[dict]:
+        """Read the built report(s) of a period and combine them into one row per key.
+
+        The first part (the core metrics) is the base: every row of the period
+        is one of its rows. Each further part adds its columns to the base row
+        with the same hash id -- the id is built from the join keys every part
+        carries, so a row means the same thing in all of them. A row that only
+        an optional part returned has no base to join and is dropped (counted
+        internally); the core report is the one that defines which rows exist.
+
+        With a single part this is exactly what the stream always emitted.
+        """
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        orphans = 0
+        for index, (part, job) in enumerate(zip(parts, jobs)):
+            for obj in job.get_result():
+                if not isinstance(obj, AdsInsights):
+                    user_logger.warning(f"[{self.name}] Unexpected result type for {report_date}")
+                    continue
+                key = self._generate_hash_id(adinsight=obj, report_breakdowns=self.report_breakdowns)
+                if index == 0:
+                    obj["id"] = key
+                    merged[key] = obj.export_all_data()
+                    order.append(key)
+                    continue
+                base = merged.get(key)
+                if base is None:
+                    orphans += 1
+                    continue
+                for column, value in obj.export_all_data().items():
+                    if column not in base:
+                        base[column] = value
+        if orphans:
+            internal_logger.warning(
+                f"[{self.name}] {orphans} row(s) of the optional parts for {report_date} had no matching row in "
+                "the core report and were dropped."
+            )
+        if len(parts) > 1:
+            internal_logger.info(
+                f"[{self.name}] Combined {len(parts)} parts for {report_date} into {len(order)} row(s)."
+            )
+        return [merged[key] for key in order]
+
+    def _split_columns_failing_the_job(self, date_obj: pendulum.Date, columns: list[str]) -> bool:
+        """Answer a date that keeps failing by asking for it in parts.
+
+        Returns True when the caller should stop and let the sync resume from
+        this date in split mode. Nothing to split (already in parts, or only
+        core metrics requested) returns False so the column hunt can run.
+        """
+        if self._split_mode or self._throttled or not self._has_optional_columns(columns):
+            return False
+        self._enter_split_mode(
+            f"the report for {date_obj.to_date_string()} failed {CONSECUTIVE_FAILURES_BEFORE_BISECT}x in a row",
+            resume_from=date_obj,
+        )
+        return True
 
     def _run_job_to_completion(
         self,
@@ -1646,17 +1976,23 @@ class AdsInsightStream(FacebookSDKStream):
 
         probe_date = until or date_obj
         probe_label = probe_date.to_date_string()
+        # The probe asks for the core metrics only. If even those do not build
+        # for one day, the account is not building reports, full stop. If they
+        # do, the probe has also just shown the way out: request the period in
+        # parts (split mode) -- the same call with every column is what failed.
+        probe_columns = self._core_columns(columns)
         user_logger.info(
             f"[{self.name}] Waiting {PROBE_BACKOFF_SECONDS}s and then checking whether Facebook can build a "
-            f"single-day report for {probe_label} before asking for the period one day at a time."
+            f"single-day report of the core metrics for {probe_label} before deciding how to ask for the period."
         )
         internal_logger.info(
             f"[{self.name}] Span {report_label} failed {SPAN_RETRIES + 1}x; backing off {PROBE_BACKOFF_SECONDS}s "
-            f"before the single-slice probe on {probe_label} so a transient outage is not read as a verdict."
+            f"before the single-slice probe on {probe_label} ({len(probe_columns)} core columns) so a transient "
+            "outage is not read as a verdict."
         )
         time.sleep(PROBE_BACKOFF_SECONDS)
 
-        probe_id = self._create_single_report(probe_date, columns, time_increment, quiet=True)
+        probe_id = self._create_single_report(probe_date, probe_columns, time_increment, quiet=True)
         if not probe_id:
             if self._throttled:
                 self._throttled_from = date_obj
@@ -1668,7 +2004,19 @@ class AdsInsightStream(FacebookSDKStream):
         if not isinstance(job, AdReportRun):
             self._mark_account_not_building(
                 report_label,
-                f"the single-day report for {probe_label} failed the same way {PROBE_BACKOFF_SECONDS}s later",
+                f"the single-day report of the core metrics for {probe_label} failed the same way "
+                f"{PROBE_BACKOFF_SECONDS}s later",
+            )
+            return
+
+        if not self._split_mode and self._has_optional_columns(columns):
+            # The core metrics build; the full set did not. Ask for the same
+            # window again in parts before giving the span shape up: a span of
+            # the core metrics is still one creation instead of 13-30.
+            self._enter_split_mode(
+                f"the span {report_label} failed {SPAN_RETRIES + 1}x with every column and the core-metrics probe "
+                f"for {probe_label} built",
+                resume_from=date_obj,
             )
             return
 
@@ -1813,6 +2161,8 @@ class AdsInsightStream(FacebookSDKStream):
         retry_count = 0
         batch_size = self.config.get("ad_insights_report_batch_size") or 30
         self._reset_run_state()
+        self._sync_context = context
+        self._restore_split_mode(context)
         batches_attempted = 0
         reports_queued = 0
         records_emitted = 0
@@ -1868,6 +2218,14 @@ class AdsInsightStream(FacebookSDKStream):
                     # date that failed, so dates already yielded in this batch are
                     # not emitted twice.
                     columns, report_date = self._resume_after_rejection(columns, report_date)
+                    continue
+
+                if self._split_from is not None:
+                    # The period is now asked for in parts. Nothing was emitted
+                    # for the date that failed, so pick the window back up there
+                    # (dates before it in the batch were already yielded).
+                    report_date = self._split_from
+                    self._split_from = None
                     continue
 
                 if self._throttled_from is not None:
