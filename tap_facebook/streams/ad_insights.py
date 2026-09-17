@@ -318,8 +318,17 @@ REJECTED_FIELDS = {
 # schema -- the column keeps existing in the warehouse, it arrives empty -- and
 # are simply not requested. A source that needs one can put it back with the
 # `insights_included_fields` config key, at its own risk.
+# Verified on 2026-09-17 in the Graph API Explorer on five ad accounts (two of
+# them syncing green): a report carrying any of these fails with 2/1504044 no
+# matter the account size or the period, while the other ~190 metrics build in
+# one report. Facebook stopped computing them around 2026-09-11 and answers with
+# the generic "report too heavy" error instead of rejecting the field.
 FIELDS_NOT_BUILT_BY_FACEBOOK = {
     "total_card_view": "async job fails with 2/1504044 even alone (Instant Experience metric)",
+    "link_clicks_per_results": "async job fails with 2/1504044 even alone since 2026-09-11 (results group)",
+    "objective_result_rate": "async job fails with 2/1504044 even alone since 2026-09-11 (results group)",
+    "opportunity_score_l4": "async job fails with 2/1504044 even alone since 2026-09-11 (beta group)",
+    "result_values_performance_indicator": "async job fails with 2/1504044 even alone since 2026-09-11 (beta group)",
 }
 
 # Sub-properties of the AdsActionStats / AdsHistogramStats nested objects.

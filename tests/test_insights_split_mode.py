@@ -508,17 +508,45 @@ class TestARefusedPartIsCutInHalves:
         assert create.call_args.args[1] == FULL and len(parts) == 1
 
 
-class TestFieldsFacebookDoesNotBuildAreNotRequested:
-    def test_total_card_view_stays_in_the_schema_but_leaves_the_request(self):
-        stream = make_stream()
-        assert "total_card_view" in FIELDS_NOT_BUILT_BY_FACEBOOK
-        assert "total_card_view" in stream.schema["properties"], "the column keeps existing, it arrives empty"
-        assert "total_card_view" not in stream._get_selected_columns()
+ALL_GROUPS_CONFIG = {
+    **SAMPLE_CONFIG,
+    "include_insights_messaging_fields": True,
+    "include_insights_commerce_fields": True,
+    "include_insights_beta_fields": True,
+    "include_insights_attribution_fields": True,
+}
 
-    def test_a_source_can_force_it_back(self):
-        tap = TapFacebook(config={**SAMPLE_CONFIG, "insights_included_fields": ["total_card_view"]})
+NOT_BUILT = sorted(FIELDS_NOT_BUILT_BY_FACEBOOK)
+
+
+class TestFieldsFacebookDoesNotBuildAreNotRequested:
+    def test_the_list_covers_the_five_fields_verified_on_2026_09_17(self):
+        assert NOT_BUILT == [
+            "link_clicks_per_results",
+            "objective_result_rate",
+            "opportunity_score_l4",
+            "result_values_performance_indicator",
+            "total_card_view",
+        ]
+
+    @pytest.mark.parametrize("field", NOT_BUILT)
+    def test_the_field_stays_in_the_schema_but_leaves_the_request(self, field):
+        stream = TapFacebook(config=ALL_GROUPS_CONFIG).streams["adsinsights"]
+        assert field in stream.schema["properties"], "the column keeps existing, it arrives empty"
+        assert field not in stream._get_selected_columns()
+
+    def test_every_other_enabled_field_is_still_requested(self):
+        stream = TapFacebook(config=ALL_GROUPS_CONFIG).streams["adsinsights"]
+        requested = set(stream._get_selected_columns())
+        expected = {f for f in stream.insights_fields if f not in FIELDS_NOT_BUILT_BY_FACEBOOK}
+        expected -= set(stream.report_breakdowns) | {"id"}
+        assert expected <= requested
+
+    @pytest.mark.parametrize("field", NOT_BUILT)
+    def test_a_source_can_force_it_back(self, field):
+        tap = TapFacebook(config={**ALL_GROUPS_CONFIG, "insights_included_fields": [field]})
         stream = tap.streams["adsinsights"]
-        assert "total_card_view" in stream._get_selected_columns()
+        assert field in stream._get_selected_columns()
 
 
 class TestThePartsArePolledInTurn:
