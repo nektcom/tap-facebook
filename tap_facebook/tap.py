@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import typing as t
+from datetime import date
 
 from nekt_singer_sdk import Tap
 from nekt_singer_sdk import typing as th
@@ -486,6 +487,39 @@ class TapFacebook(Tap):
             advanced_streams = [stream_class(tap=self) for stream_class in ADVANCED_STREAM_TYPES]
 
         return [*streams, *advanced_streams]
+
+    def load_streams(self) -> list[FacebookStream]:
+        """Order the streams for the sync.
+
+        The SDK sorts by name and syncs in that order, which is where the
+        rotation has to be applied: `discover_streams` only decides which
+        streams exist.
+        """
+        return self._insights_last_in_a_rotating_order(super().load_streams())
+
+    @staticmethod
+    def _insights_last_in_a_rotating_order(streams: list[FacebookStream]) -> list[FacebookStream]:
+        """Keep the insights streams last and start from a different one each day.
+
+        Only the insights streams spend the ad account's report budget, and
+        Facebook refuses new reports once it is gone. With a fixed order the
+        same stream is always served last, so on an account that runs out it
+        never advances at all: on facebook-ads-UQfB (2026-09-18) two streams
+        reached the current day while `adsinsights_by_country` sat nine days
+        behind, and would have stayed behind every run.
+
+        Rotating by the calendar day gives each of them the front of the queue
+        in turn, so the delay is shared instead of falling on one stream
+        forever. It needs no state and no configuration, and two runs on the
+        same day keep the same order -- a retry is not a reshuffle.
+        """
+        insights = [stream for stream in streams if isinstance(stream, AdsInsightStream)]
+        if len(insights) < 2:  # noqa: PLR2004
+            return streams
+
+        others = [stream for stream in streams if not isinstance(stream, AdsInsightStream)]
+        offset = date.today().toordinal() % len(insights)  # noqa: DTZ011
+        return [*others, *insights[offset:], *insights[:offset]]
 
 
 if __name__ == "__main__":

@@ -478,7 +478,7 @@ TRANSIENT_CREATE_ERROR_CODES = (1, 2)
 TRANSIENT_CREATE_RETRIES = 1
 TRANSIENT_CREATE_WAIT_SECONDS = 30
 
-# The span job failed twice; before the single-slice probe decides between "the
+# The span job failed every attempt; before the single-slice probe decides between "the
 # window is too big" and "the account is not building reports", give Facebook
 # time to recover from an outage. Without this the whole verdict was reached in
 # ~2 minutes, and a blip that a sibling account rode out one minute later put
@@ -494,11 +494,18 @@ PROBE_BACKOFF_SECONDS = 180
 SPAN_MAX_SLICES = 31
 
 # A span job that Facebook fails to build is recreated this many times before
-# the shape is given up on. Most job failures on a healthy account are transient
-# (~14% of jobs die at 0% and succeed on the next attempt), so one retry is
-# cheap insurance; more than that is spending the account's request budget on
-# a job that is not going to build.
-SPAN_RETRIES = 1
+# the shape is given up on. Most job failures are transient (~14% of jobs die
+# at 0% and succeed on the next attempt), and the arithmetic favours insisting:
+# one more attempt at the whole window costs ONE creation, while giving up and
+# splitting costs eight or nine. Two attempts, the old value, made the tap pay
+# the expensive answer to a question Facebook was about to answer for free --
+# see the comment on SPLIT_MODE_TTL_DAYS.
+SPAN_RETRIES = 3
+
+# Once the period is already being asked for in parts, another attempt
+# recreates every failed part, so the window keeps the single retry it had
+# before: insisting there multiplies the cost instead of avoiding it.
+SPLIT_SPAN_RETRIES = 1
 
 # How many times a per-slice report is recreated after its job fails. Each
 # retry is a new report, i.e. a new call against the account's budget. Ten
@@ -506,24 +513,29 @@ SPAN_RETRIES = 1
 # the account throttled (NEKT-5249).
 PER_SLICE_RETRIES = 2
 
-# "Service temporarily unavailable" (2/1504044) on an async insights job means
-# the report is too heavy for Facebook to build -- fields x limit x breakdowns x
-# period against the account's data volume -- not that the account is blocked
-# (Meta support, bug 1490232869529657, 16/09/2026). On the same account and
-# day, the full field set failed in seconds even with limit=25 while the 51
-# BASIC_FIELDS built fine, so the field set is the lever, not the page size.
+# Split mode asks for the same period as several smaller reports (the core
+# metrics, then one per enabled optional group), each carrying the join keys,
+# and combines the rows before they are emitted -- same rows, same columns,
+# same table. It exists because "Service temporarily unavailable" (2/1504044)
+# was read as "the report is too heavy to build" (Meta support, bug
+# 1490232869529657, 16/09/2026), backed by an Explorer test where the full
+# field set failed in seconds while the 51 BASIC_FIELDS built.
 #
-# Split mode is the fallback for exactly that: the same period is requested as
-# several smaller reports (the core metrics, then one per enabled optional
-# group), each carrying the join keys, and the rows are combined before they
-# are emitted -- same rows, same columns, same table. It is entered only after
-# the full report has failed and the core metrics alone have built, so an
-# account that builds the full report keeps paying one creation per period.
-# The verdict is remembered in the stream state for this long, so the next runs
-# do not spend two heavy failures plus a probe to rediscover it -- those failed
-# heavy requests count against the per-account #613 limit too. After that the
-# full report is tried again, in case Facebook's side has changed.
-SPLIT_MODE_TTL_DAYS = 7
+# That test is now known to have been contaminated: the field set it called
+# "too heavy" still carried the four metrics Facebook had stopped building, and
+# any report containing one of them fails whatever its size. Re-run on
+# 2026-09-18 without them, on two accounts that had just split their period
+# into eight and nine parts -- act_1053762787247772 (facebook-ads-WhFu, the very
+# account of the original test) and act_1750548592846476 (facebook-ads-TJaE) --
+# all 192 requested fields built in a single report, in under a minute, at the
+# first attempt.
+#
+# So split mode is mostly answering transient failures, and it is the most
+# expensive answer there is: eight or nine creations against the account's
+# "5 calls per 6 hours" budget where one would do. Hence a short memory -- the
+# next day's run tries the whole report again instead of carrying a verdict
+# taken on a bad night for a week.
+SPLIT_MODE_TTL_DAYS = 1
 SPLIT_MODE_STATE_KEY = "insights_split_mode_since"
 
 # A part with more columns than this is itself cut in halves. STANDARD has 69
@@ -963,6 +975,27 @@ class AdsInsightStream(FacebookSDKStream):
             return
         if not self._dates_failed and reports_queued:
             # Every date built and returned nothing: the account really is empty.
+            return
+
+        if self.get_starting_replication_key_value(self._sync_context):
+            # The table already holds this stream's history and the loader is
+            # adding to it, not replacing it, so emitting nothing cannot erase
+            # anything -- the only cost is that the stream did not advance.
+            # Failing here would be worse than the gap it guards against: three
+            # failed runs in a row disable the pipeline, which stops every other
+            # stream too. So the customer is told plainly and the run ends.
+            user_logger.warning(
+                f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
+                f"reports for {self._dates_failed} date(s), most often because the ad account's request "
+                "limit was already spent. The data extracted previously is untouched and the next run "
+                "picks up from where it stopped."
+            )
+            internal_logger.warning(
+                f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
+                f"{self._dates_failed} date(s) failed, 0 records emitted; the stream has a bookmark, so the "
+                "run is not failed -- nothing would be overwritten and a failed run would count towards "
+                "disabling the pipeline."
+            )
             return
 
         user_logger.error(
@@ -1843,10 +1876,20 @@ class AdsInsightStream(FacebookSDKStream):
             ]
             job_failures = 0
 
-            for attempt in range(max_retries + 1):
+            # One whole-period report is worth insisting on: another attempt
+            # costs one creation, while giving the shape up leads to the probe
+            # and then to eight or nine. In split mode it is not: every attempt
+            # recreates each failed part, so insisting would cost parts x
+            # attempts -- exactly the spending this is meant to avoid. There the
+            # window keeps the single retry it always had.
+            span_attempts = SPLIT_SPAN_RETRIES if self._split_mode else SPAN_RETRIES
+            attempts_allowed = span_attempts if span_until is not None else max_retries
+
+            for attempt in range(attempts_allowed + 1):
                 if attempt > 0:
                     user_logger.info(
-                        f"[{self.name}] Retrying job for {report_date} (attempt {attempt}/{max_retries}), waiting 60s..."
+                        f"[{self.name}] Retrying job for {report_date} "
+                        f"(attempt {attempt}/{attempts_allowed}), waiting 60s..."
                     )
                     time.sleep(60)
                     if not self._recreate_failed_parts(parts, date_obj, time_increment, until=span_until):
@@ -1862,11 +1905,11 @@ class AdsInsightStream(FacebookSDKStream):
                 jobs = self._run_parts_to_completion(parts, report_date)
                 if jobs is None:
                     if span_until is not None:
-                        if attempt < SPAN_RETRIES and not self._throttled:
+                        if attempt < span_attempts and not self._throttled:
                             # One more try before giving the shape up: most job
                             # failures on a healthy account are transient.
                             continue
-                        # Twice is enough. Whether the window is too big or the
+                        # Enough. Whether the window is too big or the
                         # account is refusing every report is decided by one
                         # single-slice probe, not by a 13-30 report burst.
                         self._leave_span(date_obj, report_date, columns, time_increment, until=span_until, parts=parts)
@@ -1909,7 +1952,7 @@ class AdsInsightStream(FacebookSDKStream):
                         return
 
                     user_logger.warning(
-                        f"[{self.name}] Error reading results for {report_date} (attempt {attempt}/{max_retries}): "
+                        f"[{self.name}] Error reading results for {report_date} (attempt {attempt}/{attempts_allowed}): "
                         f"{fb_err.api_error_message()}. Retrying..."
                     )
                     internal_logger.warning(
@@ -1920,7 +1963,7 @@ class AdsInsightStream(FacebookSDKStream):
                     )
                 except Exception as e:
                     user_logger.warning(
-                        f"[{self.name}] Error reading results for {report_date} (attempt {attempt}/{max_retries}): {e}. Retrying..."
+                        f"[{self.name}] Error reading results for {report_date} (attempt {attempt}/{attempts_allowed}): {e}. Retrying..."
                     )
             else:
                 # End of the ladder for this date:
@@ -1942,7 +1985,7 @@ class AdsInsightStream(FacebookSDKStream):
                     return
                 self._dates_failed += 1
                 msg = (
-                    f"[{self.name}] Insights report job failed for {report_date} after {max_retries} retries. "
+                    f"[{self.name}] Insights report job failed for {report_date} after {attempts_allowed} retries. "
                     "Data for this date was not extracted. See logs above for the specific error."
                 )
                 user_logger.error(msg)
@@ -2284,7 +2327,7 @@ class AdsInsightStream(FacebookSDKStream):
     ) -> None:
         """Decide, with one single-slice probe, whether per-slice reports are worth it.
 
-        The span job failed twice. On a healthy account that means the window
+        The span job failed every attempt. On a healthy account that means the window
         is too big for one job, and one report per slice is Facebook's own
         remedy. On an account Facebook is currently not building reports for,
         that same fallback is 13-30 creations that all fail and leave the
@@ -2391,8 +2434,8 @@ class AdsInsightStream(FacebookSDKStream):
         self._dates_failed += 1
         user_logger.error(
             f"[{self.name}] Facebook is not building performance reports for this ad account right now: "
-            f"the report covering {report_label} failed twice, and {why}. The extraction stopped here rather "
-            "than requesting the period one day at a time, which would only spend the account's request "
+            f"the report covering {report_label} failed {SPAN_RETRIES + 1} times, and {why}. The extraction "
+            "stopped here rather than requesting the period one day at a time, which would only spend the account's request "
             "limit on reports that fail the same way. Existing data was left untouched. This is a limit on "
             "Facebook's side; it has cleared on its own within a few days for other accounts, and the next "
             "scheduled run will try again."

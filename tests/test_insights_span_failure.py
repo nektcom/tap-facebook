@@ -93,14 +93,14 @@ FAILED = None  # what _run_job_to_completion returns for a job that did not buil
 
 
 class TestSpanFailure:
-    def test_a_failed_span_is_recreated_once_and_can_still_succeed(self):
+    def test_a_failed_span_is_recreated_and_can_still_succeed(self):
         stream = make_stream()
 
         with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, built_job()]) as poll, \
              mock.patch.object(stream, "_create_single_report", return_value="span-2") as create:
             list(stream._process_report_batch([span_report()], COLUMNS, 1))
 
-        assert create.call_count == SPAN_RETRIES == 1
+        assert create.call_count == 1
         assert create.call_args.kwargs["until"] == UNTIL, "the retry must keep the span shape"
         assert poll.call_count == 2
         assert stream._span_mode is True
@@ -110,13 +110,13 @@ class TestSpanFailure:
         stream = make_stream()
         probe = built_job()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, probe]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]) as create:
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[*[FAILED] * (SPAN_RETRIES + 1), probe]), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]) as create:
             list(stream._process_report_batch([span_report()], COLUMNS, 1))
 
-        # 1 span retry + 1 single-slice probe. Not 14 per-day reports.
-        assert create.call_count == 2
-        probe_call = create.call_args_list[1]
+        # The span retries + 1 single-slice probe. Not 14 per-day reports.
+        assert create.call_count == SPAN_RETRIES + 1
+        probe_call = create.call_args_list[-1]
         # The probe asks for the newest slice of the window: the oldest one may
         # sit at the edge of Facebook's retention and fail on age alone.
         assert probe_call.args[0] == UNTIL
@@ -132,15 +132,15 @@ class TestSpanFailure:
     def test_when_the_probe_fails_too_the_stream_stops_without_the_per_slice_burst(self):
         stream = make_stream()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, FAILED]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]) as create, \
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED] * (SPAN_RETRIES + 2)), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]) as create, \
              mock.patch("tap_facebook.streams.ad_insights.user_logger") as user_log:
             records = list(stream._process_report_batch([span_report()], COLUMNS, 1))
 
         assert records == []
-        # The whole cost of learning the account is not building: 3 creations
-        # (span, span retry, probe) instead of 3 + 14 + 10 per date.
-        assert create.call_count == 2
+        # The whole cost of learning the account is not building: the span
+        # retries plus one probe, instead of 14 + 10 reports per date.
+        assert create.call_count == SPAN_RETRIES + 1
         assert AdsInsightStream._account_not_building is True
         assert stream._dates_failed == 1
         assert stream._span_mode is True, "no fallback to per-slice was entered"

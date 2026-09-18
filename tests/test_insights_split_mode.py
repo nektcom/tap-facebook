@@ -34,6 +34,7 @@ from tap_facebook.streams.ad_insights import (
     FIELDS_NOT_BUILT_BY_FACEBOOK,
     RESULTS_FIELDS,
     SPLIT_MODE_STATE_KEY,
+    SPAN_RETRIES,
     SPLIT_MODE_TTL_DAYS,
     SPLIT_PART_MAX_COLUMNS,
     STANDARD_FIELDS,
@@ -183,19 +184,19 @@ class TestTheProbeOpensTheWayToSplitMode:
     def test_the_probe_asks_for_the_core_metrics_only(self):
         stream = make_stream()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, built()]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]) as create:
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[*[FAILED] * (SPAN_RETRIES + 1), built()]), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]) as create:
             list(stream._process_report_batch([span_unit()], FULL, 1))
 
-        probe_call = create.call_args_list[1]
+        probe_call = create.call_args_list[-1]  # the probe is the last creation, after the span retries
         assert probe_call.args[0] == UNTIL
         assert probe_call.args[1] == CORE, "a probe with every column would fail for the same reason as the span"
 
     def test_when_the_core_builds_the_window_is_asked_for_again_in_parts(self):
         stream = make_stream()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, built()]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]):
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[*[FAILED] * (SPAN_RETRIES + 1), built()]), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]):
             list(stream._process_report_batch([span_unit()], FULL, 1))
 
         assert stream._split_mode is True
@@ -210,8 +211,8 @@ class TestTheProbeOpensTheWayToSplitMode:
     def test_when_even_the_core_fails_the_account_is_not_building(self):
         stream = make_stream()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, FAILED]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]), \
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED] * (SPAN_RETRIES + 2)), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]), \
              mock.patch("tap_facebook.streams.ad_insights.user_logger"):
             list(stream._process_report_batch([span_unit()], FULL, 1))
 
@@ -252,8 +253,8 @@ class TestTheProbeOpensTheWayToSplitMode:
     def test_a_source_with_only_core_columns_keeps_the_old_ladder(self):
         stream = make_stream()
 
-        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[FAILED, FAILED, built()]), \
-             mock.patch.object(stream, "_create_single_report", side_effect=["span-2", "probe-1"]):
+        with mock.patch.object(stream, "_run_job_to_completion", side_effect=[*[FAILED] * (SPAN_RETRIES + 1), built()]), \
+             mock.patch.object(stream, "_create_single_report", side_effect=[*[f"span-{n}" for n in range(2, SPAN_RETRIES + 2)], "probe-1"]):
             list(stream._process_report_batch([span_unit()], CORE, 1))
 
         assert stream._split_mode is False
@@ -644,7 +645,7 @@ class TestBeingThrottledAfterQueuingIsNotAnEmptyAccount:
 class TestTheVerdictIsRememberedBetweenRuns:
     def test_a_recent_marker_starts_the_run_in_split_mode(self):
         stream = make_stream()
-        stream.stream_state[SPLIT_MODE_STATE_KEY] = pendulum.today().subtract(days=2).to_date_string()
+        stream.stream_state[SPLIT_MODE_STATE_KEY] = pendulum.today().to_date_string()
 
         stream._restore_split_mode(None)
 
