@@ -306,5 +306,42 @@ class TestTheRefusalIsNotRediscoveredOnEveryWindow:
         assert merge.call_args.kwargs["fields"] is None
 
 
+class TestAccountQuotaEndsTheStreamInsteadOfWalkingOn:
+    """The spent budget belongs to the ad account and does not come back mid-run."""
+
+    def run_until_throttled(self, code: int):
+        stream = make_stream()
+
+        def refused(*args, **kwargs):
+            stream._throttled = True
+            stream._last_throttle_code = code
+            return []
+
+        with (
+            mock.patch.object(stream, "_initialize_client"),
+            mock.patch.object(stream, "_create_report_batch", side_effect=refused),
+            mock.patch.object(
+                stream, "_advance_batch", side_effect=lambda *a, **k: pendulum.today().date().add(days=1)
+            ) as advance,
+            mock.patch.object(stream, "_fail_if_nothing_extracted") as floor,
+            mock.patch("tap_facebook.streams.ad_insights.time.sleep"),
+        ):
+            list(stream.get_records(None))
+        return advance, floor
+
+    def test_a_613_stops_the_stream_and_asks_for_no_further_window(self):
+        advance, _ = self.run_until_throttled(613)
+        advance.assert_not_called()
+
+    def test_an_app_level_throttle_keeps_the_old_behaviour(self):
+        """Codes 4 and 17 are the shared app limit, not this account's budget."""
+        advance, _ = self.run_until_throttled(4)
+        assert advance.called
+
+    def test_the_floor_still_runs_when_the_stream_stops_early(self):
+        _, floor = self.run_until_throttled(613)
+        floor.assert_called_once()
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

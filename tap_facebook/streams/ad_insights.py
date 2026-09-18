@@ -2548,6 +2548,22 @@ class AdsInsightStream(FacebookSDKStream):
                         # window, not an empty one.
                         self._dates_failed += 1
                         self._warn_throttle_is_unrecoverable()
+                        if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
+                            # The spent budget belongs to the ad account and does
+                            # not come back within the run. Walking on to the next
+                            # window only collects more refusals -- fourteen of
+                            # them on facebook-ads-69sh, the first backfill of a
+                            # source starting in 2025 -- and if the quota does
+                            # free up mid-run, a later window builds while the
+                            # skipped ones stay behind the bookmark and become a
+                            # hole no lookback reaches. Stop the stream here: the
+                            # next run picks up where the data stopped.
+                            internal_logger.warning(
+                                f"[{self.name}] Account budget spent at {report_date}; ending the stream here "
+                                f"instead of asking for the remaining windows. The {records_emitted} record(s) "
+                                "already extracted are kept and the next run resumes from them."
+                            )
+                            break
                     # Nothing queued: skip the whole span this batch just tried,
                     # not a single date -- otherwise every date is re-requested
                     # up to batch_size times before the window moves past it.
