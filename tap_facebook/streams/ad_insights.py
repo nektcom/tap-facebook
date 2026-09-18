@@ -421,7 +421,15 @@ AD_REPORT_INCREMENT_SLEEP_TIME = 1
 # after this many consecutive unreadable polls and let the report-retry ladder
 # in _process_report_batch recreate it.
 MAX_CONSECUTIVE_POLL_FAILURES = 5
-INSIGHTS_MAX_WAIT_TO_START_SECONDS = 5 * 60
+# A job still at 0% is queued behind the ad account's own load, not broken:
+# Facebook has simply not picked it up yet. Waiting costs nothing but time --
+# polling is a read -- while giving up costs a report creation to ask for the
+# same thing again, against the account's "5 calls per 6 hours" budget. So the
+# wait to START is deliberately generous, and far longer than the five minutes
+# that used to fail a whole split window (NEKT-5249: one part of nine sat at 0%
+# for 301s on facebook-ads-TJaE, the window was given up and the run ended with
+# no rows although the other eight parts had built).
+DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS = 20 * 60
 DEFAULT_INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS = 30 * 60
 JOB_STALE_ERROR_MESSAGE = (
     "This is an intermittent error and may resolve itself on "
@@ -1846,7 +1854,14 @@ class AdsInsightStream(FacebookSDKStream):
                     continue
 
                 try:
-                    yield from self._merge_part_results(parts, jobs, report_date)
+                    # Columns this account already refused earlier in the run are
+                    # named up front, so the read succeeds first time instead of
+                    # paying a refusal and a second read on every window.
+                    known_refused = AdsInsightStream._columns_refused_on_read & set(columns)
+                    first_read_fields = (
+                        [column for column in columns if column not in known_refused] if known_refused else None
+                    )
+                    yield from self._merge_part_results(parts, jobs, report_date, fields=first_read_fields)
                     break
                 except FacebookRequestError as fb_err:
                     # The report is built; a refused column is answered by
@@ -2102,6 +2117,9 @@ class AdsInsightStream(FacebookSDKStream):
         channel = state["channel"]
         report_date = state["report_date"]
         max_wait = self.config.get("insights_max_wait_to_finish_seconds", DEFAULT_INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS)
+        max_wait_to_start = self.config.get(
+            "insights_max_wait_to_start_seconds", DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS
+        )
         duration = time.time() - state["start"]
         try:
             job = state["instance"].api_get()
@@ -2141,10 +2159,11 @@ class AdsInsightStream(FacebookSDKStream):
         if status == "Job Failed":
             self._record_job_failure(job, job_id, report_date, channel)
             return "failed", None
-        if duration > INSIGHTS_MAX_WAIT_TO_START_SECONDS and percent_complete == 0:
+        if duration > max_wait_to_start and percent_complete == 0:
             channel.error(
                 f"[{self.name}] Insights job {job_id} did not start after {duration:.0f} seconds for {report_date}. "
-                + JOB_STALE_ERROR_MESSAGE
+                f"To give Facebook longer, increase 'insights_max_wait_to_start_seconds' in the tap config "
+                f"(current: {max_wait_to_start}s). " + JOB_STALE_ERROR_MESSAGE
             )
             return "failed", None
         if duration > max_wait:
@@ -2497,6 +2516,12 @@ class AdsInsightStream(FacebookSDKStream):
             if retry_count > 10:
                 user_logger.error(f"[{self.name}] Failed to get insights after 10 retries. Stopping execution.")
                 sys.exit(1)
+
+            # Once this account has refused a column, the next reports are not
+            # created with it either: the refusal is a property of the account,
+            # not of the window that happened to discover it.
+            if refused := AdsInsightStream._columns_refused_on_read & set(columns):
+                columns = [column for column in columns if column not in refused]
 
             try:
                 # Create a batch of reports in parallel

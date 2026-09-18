@@ -421,6 +421,17 @@ class TapFacebook(Tap):
             ),
         ),
         th.Property(
+            "insights_max_wait_to_start_seconds",
+            th.IntegerType,
+            default=1200,
+            description=(
+                "Maximum time in seconds to wait for a Facebook async insights job to leave 0%. A job that "
+                "has not started yet is queued behind the ad account's own load, so waiting only costs time, "
+                "while giving up costs a report creation against the account's rate limit. Increase it for "
+                "busy accounts whose reports take long to be picked up."
+            ),
+        ),
+        th.Property(
             "insights_excluded_fields",
             th.ArrayType(th.StringType),
             default=[],

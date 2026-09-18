@@ -25,7 +25,10 @@ import pendulum
 import pytest
 from facebook_business.exceptions import FacebookRequestError
 
-from tap_facebook.streams.ad_insights import AdsInsightStream
+from tap_facebook.streams.ad_insights import (
+    DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS,
+    AdsInsightStream,
+)
 from tap_facebook.tap import TapFacebook
 
 SAMPLE_CONFIG = {
@@ -225,6 +228,82 @@ class TestTheRefusalIsRememberedForTheRestOfTheRun:
     def test_a_refusal_is_not_carried_into_the_next_run(self):
         """The set lives on the class for the process only -- a new run rediscovers."""
         assert AdsInsightStream._columns_refused_on_read == set()
+
+
+
+class TestAJobThatHasNotStartedIsWaitedForNotRecreated:
+    """Polling costs nothing; giving up costs a creation against the account's budget."""
+
+    def poll(self, stream, *, elapsed: float, percent: int) -> tuple:
+        job = {"async_status": "Job Running", "async_percent_completion": percent, "id": "job-1"}
+        instance = mock.Mock()
+        instance.api_get.return_value = job
+        channel = mock.Mock()
+        state = {
+            "channel": channel,
+            "report_date": REPORT_DATE,
+            "instance": instance,
+            "start": 0.0,
+            "poll_failures": 0,
+            "sleep": 0,
+        }
+        with mock.patch("tap_facebook.streams.ad_insights.time.time", return_value=elapsed):
+            return stream._poll_job_once(state), channel
+
+    def test_the_default_budget_is_twenty_minutes(self):
+        assert DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS == 20 * 60
+
+    def test_five_minutes_at_zero_percent_is_still_pending(self):
+        """The old limit: this used to fail the part and cost a recreation."""
+        stream = make_stream()
+        (status, _), channel = self.poll(stream, elapsed=301, percent=0)
+        assert status == "pending"
+        channel.error.assert_not_called()
+
+    def test_past_the_budget_at_zero_percent_the_job_is_given_up(self):
+        stream = make_stream()
+        (status, _), channel = self.poll(stream, elapsed=DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS + 1, percent=0)
+        assert status == "failed"
+        assert "insights_max_wait_to_start_seconds" in channel.error.call_args.args[0]
+
+    def test_a_job_that_did_start_is_not_judged_by_this_budget(self):
+        stream = make_stream()
+        (status, _), _ = self.poll(stream, elapsed=DEFAULT_INSIGHTS_MAX_WAIT_TO_START_SECONDS + 1, percent=5)
+        assert status == "pending"
+
+    def test_the_source_can_raise_the_budget(self):
+        tap = TapFacebook(config={**SAMPLE_CONFIG, "insights_max_wait_to_start_seconds": 3600})
+        stream = tap.streams["adsinsights"]
+        stream._reset_run_state()
+        (status, _), _ = self.poll(stream, elapsed=1800, percent=0)
+        assert status == "pending"
+
+
+class TestTheRefusalIsNotRediscoveredOnEveryWindow:
+    """No refusal, no second read: each window pays one request, not two."""
+
+    def batch(self, stream):
+        report = {"report_run_id": "r1", "date": REPORT_DATE, "date_obj": DATE_OBJ, "next_date": DATE_OBJ.add(days=1)}
+        with (
+            mock.patch.object(stream, "_run_parts_to_completion", return_value=[mock.Mock()]),
+            mock.patch.object(stream, "_merge_part_results", return_value=[]) as merge,
+            mock.patch("tap_facebook.streams.ad_insights.time.sleep"),
+        ):
+            list(stream._process_report_batch([report], COLUMNS, 1))
+        return merge
+
+    def test_the_first_read_already_leaves_out_what_the_account_refused(self):
+        AdsInsightStream._columns_refused_on_read = {"adset_end"}
+        merge = self.batch(make_stream())
+
+        fields = merge.call_args.kwargs["fields"]
+        assert fields is not None
+        assert "adset_end" not in fields
+        assert "adset_start" in fields
+
+    def test_without_a_known_refusal_the_read_stays_as_it_was(self):
+        merge = self.batch(make_stream())
+        assert merge.call_args.kwargs["fields"] is None
 
 
 if __name__ == "__main__":
