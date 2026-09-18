@@ -551,6 +551,19 @@ THROTTLE_MAX_WAIT_SECONDS = 300
 _WORD_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _columns_never_dropped(stream: AdsInsightStream) -> set[str]:
+    """Columns that must survive any narrowing of a request or a read.
+
+    They are the replication key and the inputs of `_generate_hash_id`: without
+    them a row cannot be bookmarked or joined to the other parts of the period.
+    Facebook's #100 message sometimes echoes the whole field list of the part
+    instead of naming the single offending column (seen on facebook-ads-WhFu on
+    2026-09-18, where 13 names came back, keys included). Dropping what the
+    message names is only safe while these stay.
+    """
+    return {stream.replication_key, *stream._split_key_fields(), *(stream.report_breakdowns or [])}  # noqa: SLF001
+
+
 def _columns_named_in_error(message: str, columns: list[str]) -> list[str]:
     """Return the requested columns Facebook named in an error message.
 
@@ -986,6 +999,16 @@ class AdsInsightStream(FacebookSDKStream):
         rejected = _columns_named_in_error(message, columns)
         if not rejected:
             return False
+        if protected := set(rejected) & _columns_never_dropped(self):
+            # Same guard as the re-read: a message that names a key is echoing
+            # the request, and recreating the report without the keys would
+            # yield rows that cannot be bookmarked or joined.
+            internal_logger.warning(
+                f"[{self.name}] Ignoring a refusal for {report_date} that names key column(s) "
+                f"({', '.join(sorted(protected))}); the message is not identifying a single field. "
+                f"Original error: {message}"
+            )
+            return False
 
         self._rejected_columns = rejected
         self._restart_from = date_obj
@@ -1025,6 +1048,17 @@ class AdsInsightStream(FacebookSDKStream):
         message = fb_err.api_error_message() or str(fb_err)
         refused = _columns_named_in_error(message, columns)
         if not refused:
+            return None
+        if protected := set(refused) & _columns_never_dropped(self):
+            # The message named a key, so it is echoing the request rather than
+            # pointing at one dead field. Reading without the keys would return
+            # rows that cannot be bookmarked or joined, so leave it to the
+            # caller's slower path instead of guessing which name is the culprit.
+            internal_logger.warning(
+                f"[{self.name}] Not re-reading {report_date} without {len(refused)} column(s): the refusal "
+                f"names key column(s) ({', '.join(sorted(protected))}), so the message is not identifying a "
+                f"single field. Original error: {message}"
+            )
             return None
 
         remaining = list(columns)

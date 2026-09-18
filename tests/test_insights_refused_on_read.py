@@ -343,5 +343,65 @@ class TestAccountQuotaEndsTheStreamInsteadOfWalkingOn:
         floor.assert_called_once()
 
 
+class TestARefusalThatNamesKeyColumnsIsNotTrusted:
+    """Facebook sometimes echoes the whole field list instead of naming the culprit.
+
+    Seen on facebook-ads-WhFu (2026-09-18): the #100 message carried 13 names,
+    including date_start and the join keys. Narrowing the read to drop them
+    returned rows with no replication key and the run died with KeyError.
+    """
+
+    def refusal_naming_keys(self) -> FacebookRequestError:
+        named = "account_id, ad_id, adset_end, adset_id, adset_start, campaign_id, date_start, date_stop"
+        return FacebookRequestError(
+            message="Call was not successful",
+            request_context={},
+            http_status=400,
+            http_headers={},
+            body=(
+                '{"error": {"code": 100, "type": "OAuthException", "message": '
+                f'"(#100) Tried accessing nonexisting summary field ({named})"}}}}'
+            ),
+        )
+
+    def test_the_read_is_not_narrowed_when_a_key_is_named(self):
+        stream = make_stream()
+        columns = [*COLUMNS, "campaign_id", "date_start", "date_stop", "account_id"]
+        with mock.patch.object(stream, "_merge_part_results") as merge:
+            got = stream._reread_without_refused_columns(
+                self.refusal_naming_keys(), PARTS, [mock.Mock()], columns, REPORT_DATE
+            )
+
+        assert got is None
+        merge.assert_not_called()
+
+    def test_nothing_is_remembered_from_such_a_refusal(self):
+        stream = make_stream()
+        columns = [*COLUMNS, "campaign_id", "date_start", "date_stop", "account_id"]
+        stream._reread_without_refused_columns(
+            self.refusal_naming_keys(), PARTS, [mock.Mock()], columns, REPORT_DATE
+        )
+        assert AdsInsightStream._columns_refused_on_read == set()
+
+    def test_the_recreate_path_also_refuses_to_drop_keys(self):
+        stream = make_stream()
+        columns = [*COLUMNS, "campaign_id", "date_start", "date_stop", "account_id"]
+        acted = stream._record_columns_refused_while_reading(
+            self.refusal_naming_keys(), columns, REPORT_DATE, DATE_OBJ
+        )
+        assert acted is False
+        assert stream._rejected_columns == []
+
+    def test_a_refusal_naming_only_a_plain_column_still_works(self):
+        stream = make_stream()
+        rows = [{"ad_id": "1"}]
+        with mock.patch.object(stream, "_merge_part_results", return_value=rows) as merge:
+            got = stream._reread_without_refused_columns(
+                refusal("adset_end"), PARTS, [mock.Mock()], COLUMNS, REPORT_DATE
+            )
+        assert got == rows
+        assert merge.called
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
