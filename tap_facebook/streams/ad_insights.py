@@ -577,6 +577,16 @@ class AdsInsightStream(FacebookSDKStream):
     # halves directly instead of paying the failed whole again.
     _account_halved_parts: frozenset[str] = frozenset()
 
+    # Columns this ad account takes at report creation and then refuses when the
+    # result is read back ("(#100) Tried accessing nonexisting summary field").
+    # Shared across the whole process: the account either serves a column or it
+    # does not, so the first stream that discovers a refusal spares every other
+    # stream of the run the same round trip. Deliberately not persisted between
+    # runs -- Facebook has published no rule for which account refuses what, so
+    # each run rediscovers it and an account that starts serving a column again
+    # gets it back on its own.
+    _columns_refused_on_read: set[str] = set()  # noqa: RUF012
+
     @property
     def effective_granularity(self) -> str:
         """Return the resolved granularity for this stream.
@@ -976,6 +986,82 @@ class AdsInsightStream(FacebookSDKStream):
             f"for {report_date}: {message}. Restarting from this date without them."
         )
         return True
+
+    def _reread_without_refused_columns(
+        self,
+        fb_err: FacebookRequestError,
+        parts: list[dict],
+        jobs: list[AdReportRun],
+        columns: list[str],
+        report_date: str,
+    ) -> list[dict] | None:
+        """Read the report that is already built again, without the refused columns.
+
+        A column can pass report creation and still be refused when the result
+        is fetched ("(#100) Tried accessing nonexisting summary field"). The
+        report itself is fine -- the job completed -- so recreating it buys
+        nothing and costs a creation against the account's budget, which is the
+        scarce resource (three creations per stream instead of one, and the run
+        dies on the rate limit before the last stream is served). Naming the
+        columns on the read instead makes Facebook serve exactly those, verified
+        against a live report that answers #100 when read with no field list.
+
+        Facebook names one column at a time, so this keeps narrowing and
+        re-reading until the read succeeds. Returns the rows on success, or None
+        when this is not a refusal it can absorb -- the caller then falls back to
+        the slower path that recreates the report.
+        """
+        if fb_err.api_error_code() != FIELDS_PARAM_ERROR_CODE:
+            return None
+
+        message = fb_err.api_error_message() or str(fb_err)
+        refused = _columns_named_in_error(message, columns)
+        if not refused:
+            return None
+
+        remaining = list(columns)
+        dropped: list[str] = []
+        # One pass per column is the worst case; the guard is the loop's bound,
+        # not a retry budget -- every pass strictly shrinks `remaining`.
+        for _ in range(len(columns)):
+            dropped.extend(refused)
+            refused_set = set(refused)
+            remaining = [column for column in remaining if column not in refused_set]
+            if not remaining:
+                # Nothing left to ask for: let the caller's path report it.
+                return None
+            core_columns = set(parts[0].get("columns") or [])
+            if core_columns and not (core_columns & set(remaining)):
+                # The core report defines which rows exist; with none of its
+                # columns readable there is no base to join the rest onto, and
+                # returning the optional parts alone would emit half a row.
+                return None
+            try:
+                rows = self._merge_part_results(parts, jobs, report_date, fields=remaining)
+            except FacebookRequestError as retry_err:
+                if retry_err.api_error_code() != FIELDS_PARAM_ERROR_CODE:
+                    return None
+                retry_message = retry_err.api_error_message() or str(retry_err)
+                refused = _columns_named_in_error(retry_message, remaining)
+                if not refused:
+                    return None
+                continue
+
+            AdsInsightStream._columns_refused_on_read.update(dropped)
+            user_logger.warning(
+                f"[{self.name}] Facebook accepted {len(dropped)} metric(s) when the report was requested "
+                f"and then refused to return them for this ad account: {', '.join(sorted(dropped))}. "
+                "The remaining metrics were extracted normally and these columns arrive empty; the next "
+                "run checks them again."
+            )
+            internal_logger.warning(
+                f"[{self.name}] Re-read report(s) {[part['report_run_id'] for part in parts]} for "
+                f"{report_date} without {len(dropped)} refused column(s) ({', '.join(sorted(dropped))}) "
+                f"instead of recreating them; {len(remaining)} column(s) served. Original error: {message}"
+            )
+            return rows
+
+        return None
 
     def _resume_after_rejection(
         self,
@@ -1763,6 +1849,13 @@ class AdsInsightStream(FacebookSDKStream):
                     yield from self._merge_part_results(parts, jobs, report_date)
                     break
                 except FacebookRequestError as fb_err:
+                    # The report is built; a refused column is answered by
+                    # reading it again with a narrower field list, which costs
+                    # nothing, before falling back to recreating it.
+                    rows = self._reread_without_refused_columns(fb_err, parts, jobs, columns, report_date)
+                    if rows is not None:
+                        yield from rows
+                        break
                     if self._record_columns_refused_while_reading(fb_err, columns, report_date, date_obj):
                         return
 
@@ -1901,7 +1994,13 @@ class AdsInsightStream(FacebookSDKStream):
             return None
         return [jobs[index] for index in range(len(parts))]
 
-    def _merge_part_results(self, parts: list[dict], jobs: list[AdReportRun], report_date: str) -> list[dict]:
+    def _merge_part_results(
+        self,
+        parts: list[dict],
+        jobs: list[AdReportRun],
+        report_date: str,
+        fields: list[str] | None = None,
+    ) -> list[dict]:
         """Read the built report(s) of a period and combine them into one row per key.
 
         The first part (the core metrics) is the base: every row of the period
@@ -1912,12 +2011,33 @@ class AdsInsightStream(FacebookSDKStream):
         internally); the core report is the one that defines which rows exist.
 
         With a single part this is exactly what the stream always emitted.
+
+        `fields` narrows what the read asks for. Left out, Facebook serves the
+        list the report was created with; passed, it serves exactly these -- the
+        escape hatch for a column the account accepted at creation and refuses
+        at read (see _reread_without_refused_columns).
         """
         merged: dict[str, dict] = {}
         order: list[str] = []
         orphans = 0
         for index, (part, job) in enumerate(zip(parts, jobs)):
-            for obj in job.get_result():
+            part_fields = None
+            if fields is not None:
+                # A part only holds the columns it was created with; asking it
+                # for another part's columns is what the API would refuse.
+                part_columns = set(part.get("columns") or [])
+                part_fields = [column for column in fields if not part_columns or column in part_columns]
+                if not part_fields:
+                    # Every column of this part was refused. Reading it with an
+                    # empty list would just bring the created field set back, so
+                    # the part is skipped -- its columns arrive empty, the rows
+                    # of the other parts are kept.
+                    internal_logger.warning(
+                        f"[{self.name}] Part '{part.get('name')}' of {report_date} has no readable column "
+                        "left and was skipped."
+                    )
+                    continue
+            for obj in job.get_result(fields=part_fields):
                 if not isinstance(obj, AdsInsights):
                     user_logger.warning(f"[{self.name}] Unexpected result type for {report_date}")
                     continue
@@ -2258,7 +2378,17 @@ class AdsInsightStream(FacebookSDKStream):
                 f"[{self.name}] {len(not_built)} field(s) not requested because Facebook does not build them: "
                 + ", ".join(f"{f} ({FIELDS_NOT_BUILT_BY_FACEBOOK[f]})" for f in sorted(not_built))
             )
+        # Columns an earlier stream of this same run already saw this account
+        # accept at creation and refuse at read. Leaving them out of the request
+        # keeps the later streams from paying the same discovery round trip.
+        refused_earlier = {f for f in AdsInsightStream._columns_refused_on_read if f in columns}
+        if refused_earlier:
+            internal_logger.info(
+                f"[{self.name}] {len(refused_earlier)} field(s) not requested because this ad account "
+                f"refused to return them earlier in this run: {', '.join(sorted(refused_earlier))}"
+            )
         excluded |= not_built
+        excluded |= refused_earlier
         if excluded:
             columns = [column for column in columns if column not in excluded]
 
