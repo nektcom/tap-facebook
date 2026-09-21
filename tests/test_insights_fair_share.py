@@ -21,7 +21,7 @@ table, not replacing it, so nothing can be erased.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime, timezone
 from unittest import mock
 
 import pytest
@@ -53,13 +53,21 @@ def insights_order(tap: TapFacebook) -> list[str]:
     return [stream.name for stream in tap.streams.values() if isinstance(stream, AdsInsightStream)]
 
 
+def at(year: int, month: int, day: int, hour: int):
+    """Pin the clock the rotation reads."""
+    patched = mock.patch("tap_facebook.tap.datetime")
+    fake = patched.start()
+    fake.now.return_value = datetime(year, month, day, hour, tzinfo=timezone.utc)
+    return patched
+
+
 class TestTheInsightsStreamsTakeTurnsGoingFirst:
-    def test_the_order_rotates_with_the_calendar_day(self):
+    def test_the_order_rotates_over_time(self):
         seen = set()
         for day in range(1, 8):
-            with mock.patch("tap_facebook.tap.date") as patched:
-                patched.today.return_value = date(2026, 9, day)
-                seen.add(tuple(insights_order(make_tap())))
+            clock = at(2026, 9, day, 4)
+            seen.add(tuple(insights_order(make_tap())))
+            clock.stop()
 
         # Six insights streams, so a week of runs must show more than one order.
         assert len(seen) > 1
@@ -67,17 +75,39 @@ class TestTheInsightsStreamsTakeTurnsGoingFirst:
     def test_every_stream_gets_the_front_of_the_queue_within_a_cycle(self):
         first_ones = set()
         for day in range(1, 31):
-            with mock.patch("tap_facebook.tap.date") as patched:
-                patched.today.return_value = date(2026, 9, day)
-                first_ones.add(insights_order(make_tap())[0])
+            clock = at(2026, 9, day, 4)
+            first_ones.add(insights_order(make_tap())[0])
+            clock.stop()
 
         assert len(first_ones) == len(insights_order(make_tap()))
 
-    def test_two_runs_on_the_same_day_keep_the_same_order(self):
-        """A retry must not reshuffle: the same day is the same queue."""
-        with mock.patch("tap_facebook.tap.date") as patched:
-            patched.today.return_value = date(2026, 9, 18)
+    def test_a_daily_pipeline_at_a_fixed_hour_still_rotates(self):
+        """Counting total hours would freeze it: 24 is a multiple of six."""
+        firsts = set()
+        for day in range(1, 8):
+            clock = at(2026, 9, day, 4)
+            firsts.add(insights_order(make_tap())[0])
+            clock.stop()
+
+        assert len(firsts) > 1
+
+    def test_the_three_runs_of_one_day_do_not_take_the_same_order(self):
+        """facebook-ads-WYkS lost the same stream three times on 2026-09-20."""
+        firsts = set()
+        for hour in (4, 12, 20):
+            clock = at(2026, 9, 20, hour)
+            firsts.add(insights_order(make_tap())[0])
+            clock.stop()
+
+        assert len(firsts) > 1
+
+    def test_a_retry_within_the_hour_keeps_the_same_order(self):
+        """A retry must not reshuffle: the same hour is the same queue."""
+        clock = at(2026, 9, 18, 4)
+        try:
             assert insights_order(make_tap()) == insights_order(make_tap())
+        finally:
+            clock.stop()
 
     def test_the_insights_streams_still_come_after_the_others(self):
         names = [stream.name for stream in make_tap().streams.values()]
@@ -179,6 +209,47 @@ class TestTheWholeReportIsInsistedOnBeforePayingForParts:
         stream._restore_split_mode(None)
 
         assert stream._split_mode is True
+
+
+class TestAPartiallyExtractedStreamIsAnnounced:
+    """A green run that lost some dates must not read as a complete one.
+
+    Until v1.81 the floor returned in silence as soon as one record had been
+    emitted, so a stream that got three days out of ten said nothing at all.
+    """
+
+    def stream(self) -> AdsInsightStream:
+        stream = make_tap().streams["adsinsights"]
+        stream._reset_run_state()
+        stream._sync_context = None
+        return stream
+
+    def test_the_customer_is_told_when_some_dates_were_refused(self):
+        stream = self.stream()
+        stream._dates_failed = 3
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
+            stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=4, records_emitted=120)
+
+        said = logged.warning.call_args.args[0]
+        assert "only partially updated" in said
+        assert "3 date(s)" in said
+        assert not logged.error.called
+
+    def test_a_complete_run_says_nothing(self):
+        stream = self.stream()
+        stream._dates_failed = 0
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
+            stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=4, records_emitted=120)
+
+        assert not logged.warning.called
+        assert not logged.error.called
+
+    def test_the_partial_run_is_not_failed(self):
+        stream = self.stream()
+        stream._dates_failed = 3
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger"):
+            # No SystemExit: the table moved forward and the bookmark is kept.
+            stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=4, records_emitted=120)
 
 
 if __name__ == "__main__":

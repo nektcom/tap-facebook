@@ -392,6 +392,44 @@ class TestARefusalThatNamesKeyColumnsIsNotTrusted:
         assert acted is False
         assert stream._rejected_columns == []
 
+    def test_a_later_pass_naming_keys_stops_the_loop(self):
+        """The regression that disabled facebook-ads-TJaE and -WhFu on 2026-09-19/20.
+
+        The first refusal names one harmless column, so the re-read starts. The
+        read of the narrowed report then answers with the whole field list,
+        keys included. Until v1.81 only the first refusal was checked, so the
+        loop dropped the keys on this second pass and the rows came back with no
+        `date_start`.
+        """
+        stream = make_stream()
+        columns = [*COLUMNS, "campaign_id", "date_start", "date_stop", "account_id"]
+        with mock.patch.object(
+            stream, "_merge_part_results", side_effect=self.refusal_naming_keys()
+        ) as merge:
+            got = stream._reread_without_refused_columns(
+                refusal("adset_end"), PARTS, [mock.Mock()], columns, REPORT_DATE
+            )
+
+        assert got is None
+        assert merge.call_count == 1
+        # And nothing is carried to the other streams of this run.
+        assert AdsInsightStream._columns_refused_on_read == set()
+
+    def test_a_later_pass_naming_a_plain_column_keeps_narrowing(self):
+        """The loop itself is untouched: only a refusal naming a key stops it."""
+        stream = make_stream()
+        rows = [{"ad_id": "1"}]
+        with mock.patch.object(
+            stream, "_merge_part_results", side_effect=[refusal("adset_start"), rows]
+        ) as merge:
+            got = stream._reread_without_refused_columns(
+                refusal("adset_end"), PARTS, [mock.Mock()], COLUMNS, REPORT_DATE
+            )
+
+        assert got == rows
+        assert merge.call_count == 2
+        assert AdsInsightStream._columns_refused_on_read == {"adset_end", "adset_start"}
+
     def test_a_refusal_naming_only_a_plain_column_still_works(self):
         stream = make_stream()
         rows = [{"ad_id": "1"}]

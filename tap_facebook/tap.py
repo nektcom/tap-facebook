@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import typing as t
-from datetime import date
+from datetime import datetime, timezone
 
 from nekt_singer_sdk import Tap
 from nekt_singer_sdk import typing as th
@@ -499,7 +499,7 @@ class TapFacebook(Tap):
 
     @staticmethod
     def _insights_last_in_a_rotating_order(streams: list[FacebookStream]) -> list[FacebookStream]:
-        """Keep the insights streams last and start from a different one each day.
+        """Keep the insights streams last and start from a different one each hour.
 
         Only the insights streams spend the ad account's report budget, and
         Facebook refuses new reports once it is gone. With a fixed order the
@@ -508,17 +508,30 @@ class TapFacebook(Tap):
         reached the current day while `adsinsights_by_country` sat nine days
         behind, and would have stayed behind every run.
 
-        Rotating by the calendar day gives each of them the front of the queue
-        in turn, so the delay is shared instead of falling on one stream
-        forever. It needs no state and no configuration, and two runs on the
-        same day keep the same order -- a retry is not a reshuffle.
+        Rotating gives each of them the front of the queue in turn, so the delay
+        is shared instead of falling on one stream forever. The turn counts the
+        hour as well as the day, because a pipeline is scheduled several times a
+        day: on facebook-ads-WYkS (2026-09-20) the three runs of the day all
+        took the same order, so `adsinsights` lost its turn three times in a row
+        and stayed on the same bookmark.
+
+        Day and hour are added rather than combined into a single count of
+        hours: a pipeline that runs once a day at a fixed hour would advance by
+        24 turns each day, and 24 is a multiple of six, so with six insights
+        streams that pipeline would take the same order forever -- the very
+        starvation this is meant to end. Added, it advances one turn a day
+        there, and by the gap between runs on a pipeline scheduled more often.
+        Two runs within the same hour still take the same order: a retry is not
+        a reshuffle.
         """
         insights = [stream for stream in streams if isinstance(stream, AdsInsightStream)]
         if len(insights) < 2:  # noqa: PLR2004
             return streams
 
         others = [stream for stream in streams if not isinstance(stream, AdsInsightStream)]
-        offset = date.today().toordinal() % len(insights)  # noqa: DTZ011
+        now = datetime.now(tz=timezone.utc)
+        turn = now.date().toordinal() + now.hour
+        offset = turn % len(insights)
         return [*others, *insights[offset:], *insights[:offset]]
 
 

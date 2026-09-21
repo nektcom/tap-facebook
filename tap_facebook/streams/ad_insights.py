@@ -970,8 +970,26 @@ class AdsInsightStream(FacebookSDKStream):
         load reads that as an empty snapshot -- overwriting a populated table.
         But an account that genuinely did not spend anything must still finish
         green, so a run where every date built fine is never failed here.
+
+        A run that extracted some dates and lost others is neither case: the
+        table did move forward, so nothing is failed, but the customer would
+        otherwise read a green run as a complete one. It is told instead.
         """
-        if not batches_attempted or records_emitted:
+        if not batches_attempted:
+            return
+        if records_emitted:
+            if self._dates_failed:
+                user_logger.warning(
+                    f"[{self.name}] This stream was only partially updated: Facebook refused the "
+                    f"performance reports for {self._dates_failed} date(s), most often because the ad "
+                    "account's request limit was already spent. The dates that were extracted are in "
+                    "the table; the refused ones are not, and the next run picks them up."
+                )
+                internal_logger.warning(
+                    f"[{self.name}] Partial extraction: {self._dates_failed} date(s) failed while "
+                    f"{records_emitted} record(s) were emitted over {batches_attempted} batch(es) and "
+                    f"{reports_queued} queued report(s). The run stays green; the bookmark is not capped."
+                )
             return
         if not self._dates_failed and reports_queued:
             # Every date built and returned nothing: the account really is empty.
@@ -1010,6 +1028,39 @@ class AdsInsightStream(FacebookSDKStream):
         )
         sys.exit(1)
 
+    def _refused_columns_safe_to_drop(
+        self,
+        message: str,
+        columns: list[str],
+        report_date: str,
+    ) -> list[str] | None:
+        """The columns Facebook named in `message`, or None when it names a key.
+
+        A message that names the replication key or one of the join keys is
+        echoing the request instead of pointing at a single dead field (seen on
+        facebook-ads-WhFu on 2026-09-18, where 13 names came back, keys
+        included). Dropping those leaves rows that cannot be bookmarked or
+        joined, and the run then dies far from here with `KeyError: 'date_start'`
+        inside the SDK's state handling.
+
+        This is the one place that decides, and it is asked again on EVERY pass
+        of the re-read loop -- not only the first. Facebook names a few columns
+        at a time, so the pass that echoes the keys is usually a later one; that
+        is exactly how facebook-ads-TJaE and facebook-ads-WhFu were disabled on
+        2026-09-19/20 despite the guard that only ran on the first refusal.
+        """
+        refused = _columns_named_in_error(message, columns)
+        if not refused:
+            return None
+        if protected := set(refused) & _columns_never_dropped(self):
+            internal_logger.warning(
+                f"[{self.name}] Refusal for {report_date} names key column(s) "
+                f"({', '.join(sorted(protected))}), so the message is not identifying a single field; "
+                f"no column is dropped. Original error: {message}"
+            )
+            return None
+        return refused
+
     def _record_columns_refused_while_reading(
         self,
         fb_err: FacebookRequestError,
@@ -1029,18 +1080,8 @@ class AdsInsightStream(FacebookSDKStream):
             return False
 
         message = fb_err.api_error_message() or str(fb_err)
-        rejected = _columns_named_in_error(message, columns)
+        rejected = self._refused_columns_safe_to_drop(message, columns, report_date)
         if not rejected:
-            return False
-        if protected := set(rejected) & _columns_never_dropped(self):
-            # Same guard as the re-read: a message that names a key is echoing
-            # the request, and recreating the report without the keys would
-            # yield rows that cannot be bookmarked or joined.
-            internal_logger.warning(
-                f"[{self.name}] Ignoring a refusal for {report_date} that names key column(s) "
-                f"({', '.join(sorted(protected))}); the message is not identifying a single field. "
-                f"Original error: {message}"
-            )
             return False
 
         self._rejected_columns = rejected
@@ -1079,19 +1120,8 @@ class AdsInsightStream(FacebookSDKStream):
             return None
 
         message = fb_err.api_error_message() or str(fb_err)
-        refused = _columns_named_in_error(message, columns)
+        refused = self._refused_columns_safe_to_drop(message, columns, report_date)
         if not refused:
-            return None
-        if protected := set(refused) & _columns_never_dropped(self):
-            # The message named a key, so it is echoing the request rather than
-            # pointing at one dead field. Reading without the keys would return
-            # rows that cannot be bookmarked or joined, so leave it to the
-            # caller's slower path instead of guessing which name is the culprit.
-            internal_logger.warning(
-                f"[{self.name}] Not re-reading {report_date} without {len(refused)} column(s): the refusal "
-                f"names key column(s) ({', '.join(sorted(protected))}), so the message is not identifying a "
-                f"single field. Original error: {message}"
-            )
             return None
 
         remaining = list(columns)
@@ -1117,7 +1147,9 @@ class AdsInsightStream(FacebookSDKStream):
                 if retry_err.api_error_code() != FIELDS_PARAM_ERROR_CODE:
                     return None
                 retry_message = retry_err.api_error_message() or str(retry_err)
-                refused = _columns_named_in_error(retry_message, remaining)
+                # Asked again, keys included: a later pass is just as likely to
+                # come back with the whole field list as the first one.
+                refused = self._refused_columns_safe_to_drop(retry_message, remaining, report_date)
                 if not refused:
                     return None
                 continue
