@@ -41,10 +41,13 @@ def has_reached_api_limit(headers: dict, account_id: str) -> bool:
         )  # This time is in minutes according to the docs
         reset_time_duration = int(ad_account_usage.get("reset_time_duration", 0))
 
-        internal_logger.info(
+        # Debug, not info: this runs on every HTTP 200 (client.validate_response)
+        # and the result is discarded there, so at info it was two lines per
+        # request for a value nobody uses -- the largest emitter of the tap.
+        internal_logger.debug(
             f"API Usage | Call Count: {call_count}%, CPU Time: {total_cputime}%, Total Time: {total_time}%, Ad Account Usage: {acc_id_util_pct}%"
         )
-        internal_logger.info(
+        internal_logger.debug(
             f"API Usage | Estimated time to regain access (BUC): {estimated_time_to_regain_access}s, Reset time duration (Ad Account): {reset_time_duration}s"
         )
 
@@ -60,7 +63,8 @@ def has_reached_api_limit(headers: dict, account_id: str) -> bool:
         else:
             return False
     else:
-        internal_logger.warning("API Usage | No usage data found in headers.")
+        # Fires on every response that comes without the headers; not an anomaly.
+        internal_logger.debug("API Usage | No usage data found in headers.")
         return False
 
 

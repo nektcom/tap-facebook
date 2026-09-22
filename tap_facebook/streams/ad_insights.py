@@ -1281,6 +1281,17 @@ class AdsInsightStream(FacebookSDKStream):
         "include_insights_attribution_fields": ATTRIBUTION_FIELDS,
     }
 
+    # The titles these settings carry in nekt.config.json, so the customer reads
+    # the name they see in the source form rather than a config key.
+    OPTIONAL_FIELD_GROUP_TITLES: t.ClassVar[dict[str, str]] = {
+        "include_insights_standard_fields": "Ads Insights: Include additional standard metrics",
+        "include_insights_messaging_fields": "Ads Insights: Include messaging ads metrics",
+        "include_insights_commerce_fields": "Ads Insights: Include commerce metrics",
+        "include_insights_beta_fields": "Ads Insights: Include beta metrics",
+        "include_insights_results_fields": "Ads Insights: Include objective-based results metrics",
+        "include_insights_attribution_fields": "Ads Insights: Include SKAN and attribution metrics",
+    }
+
     @property
     def enabled_field_groups(self) -> list[str]:
         """Names of the optional field groups enabled for this source."""
@@ -1359,14 +1370,26 @@ class AdsInsightStream(FacebookSDKStream):
                 f"installed facebook-business SDK and will be skipped: {', '.join(gone)}"
             )
 
+        # Which optional groups are off is the customer's call and something
+        # they can act on, so it goes to them -- once per stream, and one line
+        # for all groups instead of one per group. The internal line keeps the
+        # field names.
         requested = set(self.insights_fields)
-        for key, fields in self.OPTIONAL_FIELD_GROUPS.items():
-            skipped = sorted(set(fields) & available - requested)
-            if skipped:
-                internal_logger.info(
-                    f"[{self.name}] {len(skipped)} field(s) not requested. Set "
-                    f"{key} to true to include them: {', '.join(skipped)}"
-                )
+        skipped_by_group = {
+            key: sorted(set(fields) & available - requested) for key, fields in self.OPTIONAL_FIELD_GROUPS.items()
+        }
+        skipped_by_group = {key: fields for key, fields in skipped_by_group.items() if fields}
+        if skipped_by_group and not getattr(self, "_optional_groups_logged", False):
+            self._optional_groups_logged = True
+            titles = [self.OPTIONAL_FIELD_GROUP_TITLES.get(key, key) for key in skipped_by_group]
+            user_logger.info(
+                f"[{self.name}] Some optional metric groups are not included in this source: "
+                f"{'; '.join(titles)}. They can be enabled in the source's advanced settings."
+            )
+            internal_logger.info(
+                f"[{self.name}] {sum(len(v) for v in skipped_by_group.values())} field(s) not requested, by setting: "
+                + " | ".join(f"{key}={','.join(fields)}" for key, fields in skipped_by_group.items())
+            )
 
         unclassified = sorted(available - known - set(REJECTED_FIELDS))
         if unclassified:
@@ -2092,7 +2115,9 @@ class AdsInsightStream(FacebookSDKStream):
             return None
 
         pending = {
-            index: self._new_poll_state(AdReportRun(part["report_run_id"]), f"{report_date} [{part['name']}]")
+            index: self._new_poll_state(
+                AdReportRun(part["report_run_id"]), f"{report_date} [{part['name']}]", announce=False
+            )
             for index, part in enumerate(parts)
         }
         jobs: dict[int, AdReportRun] = {}
@@ -2116,6 +2141,10 @@ class AdsInsightStream(FacebookSDKStream):
                     f"{', '.join(failed)}. The period is not emitted until every part has built."
                 )
             return None
+        # One line for the period, not one per part: the customer asked for a
+        # report, and how it was cut up is ours.
+        user_logger.info(f"[{self.name}] Report for {report_date} is ready.")
+        internal_logger.info(f"[{self.name}] All {len(parts)} part(s) built for {report_date}.")
         return [jobs[index] for index in range(len(parts))]
 
     def _merge_part_results(
@@ -2204,12 +2233,25 @@ class AdsInsightStream(FacebookSDKStream):
         )
         return True
 
-    def _new_poll_state(self, report_instance: AdReportRun, report_date: str, *, quiet: bool = False) -> dict:
-        """Everything one async job needs between two status checks."""
+    def _new_poll_state(
+        self,
+        report_instance: AdReportRun,
+        report_date: str,
+        *,
+        quiet: bool = False,
+        announce: bool = True,
+    ) -> dict:
+        """Everything one async job needs between two status checks.
+
+        `announce` says whether this job tells the customer it is ready. It is
+        off for the parts of a split period, which announce once as a whole in
+        `_run_parts_to_completion`, and always off when `quiet`.
+        """
         return {
             "instance": report_instance,
             "report_date": report_date,
             "channel": internal_logger if quiet else user_logger,
+            "announce": announce and not quiet,
             "start": time.time(),
             "poll_failures": 0,
             "sleep": POLL_JOB_SLEEP_TIME,
@@ -2261,9 +2303,20 @@ class AdsInsightStream(FacebookSDKStream):
             return "pending", None
         state["poll_failures"] = 0
         state["sleep"] = POLL_JOB_SLEEP_TIME
-        channel.info(f"[{self.name}] ID: {job_id} - {status} for {report_date} - {percent_complete}% done. ")
+        # One line per status check, so internal debug only: at info on the
+        # customer channel this put the progress of every poll in their log.
+        internal_logger.debug(f"[{self.name}] ID: {job_id} - {status} for {report_date} - {percent_complete}% done.")
 
         if status == "Job Completed":
+            done = f"[{self.name}] Insights job {job_id} completed for {report_date} after {duration:.0f}s."
+            if state["announce"]:
+                # The internal pair of the customer line, at the same cadence.
+                user_logger.info(f"[{self.name}] Report for {report_date} is ready.")
+                internal_logger.info(done)
+            else:
+                # A part of a split period, or a probe: the period announces
+                # itself once, so each part stays at debug.
+                internal_logger.debug(done)
             return "completed", job
         if status == "Job Failed":
             self._record_job_failure(job, job_id, report_date, channel)
@@ -2274,12 +2327,22 @@ class AdsInsightStream(FacebookSDKStream):
                 f"To give Facebook longer, increase 'insights_max_wait_to_start_seconds' in the tap config "
                 f"(current: {max_wait_to_start}s). " + JOB_STALE_ERROR_MESSAGE
             )
+            if channel is not internal_logger:
+                internal_logger.error(
+                    f"[{self.name}] AdReportRun {job_id} for {report_date} still at 0% ({status}) after "
+                    f"{duration:.0f}s; budget insights_max_wait_to_start_seconds={max_wait_to_start}s."
+                )
             return "failed", None
         if duration > max_wait:
             channel.error(
                 f"[{self.name}] Insights job {job_id} did not complete after {max_wait}s for {report_date}. "
                 f"To fix this, increase 'insights_max_wait_to_finish_seconds' in the tap config (current: {max_wait}s)."
             )
+            if channel is not internal_logger:
+                internal_logger.error(
+                    f"[{self.name}] AdReportRun {job_id} for {report_date} at {percent_complete}% ({status}) after "
+                    f"{duration:.0f}s; budget insights_max_wait_to_finish_seconds={max_wait}s."
+                )
             return "failed", None
         return "pending", None
 
@@ -2298,7 +2361,7 @@ class AdsInsightStream(FacebookSDKStream):
                 return job
             if outcome == "failed":
                 return None
-            internal_logger.info(f"[{self.name}] Sleeping for {state['sleep']} seconds until job is done")
+            internal_logger.debug(f"[{self.name}] Sleeping for {state['sleep']} seconds until job is done")
             time.sleep(state["sleep"])
 
     def _record_job_failure(self, job: th.Any, job_id: str, report_date: str, channel: th.Any) -> None:
