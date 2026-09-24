@@ -493,6 +493,25 @@ PROBE_BACKOFF_SECONDS = 180
 # backfill does not turn into a single job Facebook cannot build.
 SPAN_MAX_SLICES = 31
 
+# Facebook's answer when the report asked for is too big to build: the job ends
+# as "Job Failed" with error_code=-3, error_subcode=1504045, "Out of memory"
+# ("O relatório de insights é muito grande"). Unlike 2/1504044 it is not
+# transient -- the same window fails the same way every time -- and the remedy
+# is the one Facebook names: less data per call. On facebook-ads-TJaE and
+# facebook-ads-WhFu (2026-09-20..24) the bookmark sat on 2026-09-04, so the
+# window grew by one day every day, failed on size every run, and the stream
+# never advanced; the same two accounts had built all 192 fields for ONE day in
+# the Graph API Explorer on 2026-09-18. Splitting by columns does not help
+# there -- the rows are the weight -- so the window is cut by days instead.
+REPORT_TOO_LARGE_SUBCODES = frozenset({1504045})
+
+# The window width (in slices) that the account last built, kept in the state so
+# the next runs start there instead of rediscovering it at the cost of a
+# creation per attempt. It expires so a quieter account gets the wide window
+# back; one failed attempt at the full width is all that costs.
+SPAN_WIDTH_STATE_KEY = "insights_span_width"
+SPAN_WIDTH_TTL_DAYS = 7
+
 # A span job that Facebook fails to build is recreated this many times before
 # the shape is given up on. Most job failures are transient (~14% of jobs die
 # at 0% and succeed on the next attempt), and the arithmetic favours insisting:
@@ -620,6 +639,13 @@ class AdsInsightStream(FacebookSDKStream):
     # gets it back on its own.
     _columns_refused_on_read: set[str] = set()  # noqa: RUF012
 
+    # Streams that extracted only part of the period on a run with no bookmark
+    # to fall back on -- a full sync, or a source's first sync. The stream
+    # itself finishes normally so its bookmark is saved (the stream is unsorted,
+    # so an exit mid-stream would throw the progress away) and the tap fails the
+    # run once every stream is done; see TapFacebook.sync_all.
+    _incomplete_without_history: list[str] = []  # noqa: RUF012
+
     @property
     def effective_granularity(self) -> str:
         """Return the resolved granularity for this stream.
@@ -670,6 +696,15 @@ class AdsInsightStream(FacebookSDKStream):
         self._span_mode = True
         self._span_disabled = False
         self._span_failed_from: pendulum.Date | None = None
+        # How many slices one span report covers. Narrowed when Facebook says
+        # the report is too large (see REPORT_TOO_LARGE_SUBCODES), and read
+        # back from the state by _restore_span_width.
+        self._span_slices = SPAN_MAX_SLICES
+        self._span_resize_from: pendulum.Date | None = None
+        # Set by _record_job_failure for the attempt in progress, and for the
+        # whole run so the floor can name the cause to the customer.
+        self._job_too_large = False
+        self._report_too_large_seen = False
         # Set when report creation is refused for quota while a batch is being
         # processed, so the caller can resume that window as a single report.
         self._throttled_from: pendulum.Date | None = None
@@ -910,6 +945,83 @@ class AdsInsightStream(FacebookSDKStream):
             f"resuming from {resume_from.to_date_string()}; remembered for {SPLIT_MODE_TTL_DAYS} days."
         )
 
+    def _slices_between(self, start: pendulum.Date, until: pendulum.Date, time_increment: int | str) -> int:
+        """How many slices of `time_increment` a window from `start` to `until` covers."""
+        slices = 0
+        current = start
+        while current <= until:
+            slices += 1
+            current = self._advance_date(current, time_increment)
+        return slices
+
+    def _shrink_span_after_too_large(
+        self,
+        date_obj: pendulum.Date,
+        span_until: pendulum.Date,
+        report_date: str,
+        time_increment: int | str,
+    ) -> bool:
+        """Answer "the report is too large" by asking for the same dates in half the window.
+
+        Returns False when the window is already a single slice: then there is
+        nothing left to cut by days and the usual ladder (retry, probe, split by
+        columns) takes over. The narrower width is kept in the state for the
+        next runs (SPAN_WIDTH_TTL_DAYS).
+        """
+        slices = self._slices_between(date_obj, span_until, time_increment)
+        if slices <= 1:
+            return False
+        narrower = max(1, slices // 2)
+        self._span_slices = narrower
+        self._span_resize_from = date_obj
+        try:
+            state = self.get_context_state(self._sync_context)
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not record the span width in the state.", exc_info=True)
+        else:
+            state[SPAN_WIDTH_STATE_KEY] = {"slices": narrower, "since": pendulum.today().to_date_string()}
+        unit = "day(s)" if time_increment == 1 else "period(s)"
+        user_logger.info(
+            f"[{self.name}] Facebook said the report for {report_date} was too large to build. Asking for the "
+            f"same dates in smaller reports of {narrower} {unit} each; nothing is skipped."
+        )
+        internal_logger.info(
+            f"[{self.name}] act_{self.config.get('account_id')}: span {report_date} ({slices} slices) failed on "
+            f"size (subcode in {sorted(REPORT_TOO_LARGE_SUBCODES)}); width {slices} -> {narrower}, resuming from "
+            f"{date_obj.to_date_string()}, remembered for {SPAN_WIDTH_TTL_DAYS} days. Last job error: "
+            f"{self._last_job_error!r}"
+        )
+        return True
+
+    def _restore_span_width(self, context: dict | None) -> None:
+        """Start at the window width a recent run found this account can build."""
+        try:
+            state = self.get_context_state(context)
+        except Exception:  # noqa: BLE001
+            internal_logger.warning(f"[{self.name}] Could not read the span width from the state.", exc_info=True)
+            return
+        marker = state.get(SPAN_WIDTH_STATE_KEY)
+        if not marker:
+            return
+        try:
+            slices = int(marker["slices"])
+            since = pendulum.parse(str(marker["since"])).date()
+        except Exception:  # noqa: BLE001 -- an unreadable marker is dropped, not trusted
+            state.pop(SPAN_WIDTH_STATE_KEY, None)
+            return
+        if since.add(days=SPAN_WIDTH_TTL_DAYS) < pendulum.today().date() or slices < 1:
+            state.pop(SPAN_WIDTH_STATE_KEY, None)
+            internal_logger.info(
+                f"[{self.name}] Span width marker ({slices} slices, {since.to_date_string()}) expired; "
+                f"trying the full {SPAN_MAX_SLICES}-slice window again."
+            )
+            return
+        self._span_slices = min(slices, SPAN_MAX_SLICES)
+        internal_logger.info(
+            f"[{self.name}] Starting with {self._span_slices}-slice windows, as found on "
+            f"{since.to_date_string()} for this account (Facebook refused wider reports as too large)."
+        )
+
     def _restore_split_mode(self, context: dict | None) -> None:
         """Start in split mode when this process or a recent run already found it necessary."""
         if AdsInsightStream._account_split_mode:
@@ -957,74 +1069,118 @@ class AdsInsightStream(FacebookSDKStream):
         time.sleep(self._throttle_wait)
         self._throttle_wait = 0
 
+    def _has_history(self) -> bool:
+        """Whether a previous run left a real bookmark for this stream.
+
+        Not the same as `get_starting_replication_key_value`: with no state --
+        a full sync, or a source's first sync -- the SDK seeds that value with
+        the configured `start_date` (`_write_starting_replication_value`), so it
+        is never empty. Reading it as "there is history" is what let a full sync
+        of facebook-ads-TJaE on 2026-09-23 end green with seven insights tables
+        replaced by empty snapshots, while the customer was told the previous
+        data was untouched. Only a finalized `replication_key_value` means the
+        loader is adding to a table rather than replacing it.
+        """
+        try:
+            state = self.get_context_state(self._sync_context)
+        except Exception:  # noqa: BLE001 -- no readable state is no history
+            return False
+        return state.get("replication_key_value") not in (None, "")
+
+    def _why_reports_were_refused(self) -> str:
+        """The cause to name to the customer, from what this run actually saw."""
+        if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
+            return "the ad account's request limit was already spent"
+        if self._report_too_large_seen:
+            return "Facebook said the report was too large to build"
+        return "Facebook did not build them"
+
     def _fail_if_nothing_extracted(
         self,
         batches_attempted: int,
         reports_queued: int,
         records_emitted: int,
     ) -> None:
-        """Abort the run when nothing was extracted AND something went wrong.
+        """Decide how a stream that lost dates ends: warn, fail at the end, or fail now.
 
-        Both halves matter. Ending cleanly with no records is indistinguishable
-        from "the account had no delivery in this period", and a full-refresh
-        load reads that as an empty snapshot -- overwriting a populated table.
-        But an account that genuinely did not spend anything must still finish
-        green, so a run where every date built fine is never failed here.
+        With history (a real bookmark) the loader adds to the table, so a gap
+        costs nothing that the next run cannot fill: the stream warns and the
+        run stays green (three red runs in a row would disable the pipeline and
+        stop every other stream too).
 
-        A run that extracted some dates and lost others is neither case: the
-        table did move forward, so nothing is failed, but the customer would
-        otherwise read a green run as a complete one. It is told instead.
+        Without history -- a full sync, or a first sync -- the destination
+        replaces the table with what this run extracted. Then a gap is a real
+        failure and is never reported as a success:
+        - some rows: the stream finishes normally so its bookmark is saved and
+          the next runs continue from it; the tap fails the run once every
+          stream is done (TapFacebook.sync_all);
+        - no rows: the run fails here, before the later streams start, so no
+          other table is replaced with an empty one.
+
+        An account that genuinely had nothing to report -- every date built and
+        returned no rows -- still finishes green.
         """
         if not batches_attempted:
             return
+        has_history = self._has_history()
+        why = self._why_reports_were_refused()
         if records_emitted:
-            if self._dates_failed:
+            if not self._dates_failed:
+                return
+            if has_history:
                 user_logger.warning(
-                    f"[{self.name}] This stream was only partially updated: Facebook refused the "
-                    f"performance reports for {self._dates_failed} date(s), most often because the ad "
-                    "account's request limit was already spent. The dates that were extracted are in "
+                    f"[{self.name}] This stream was only partially updated: Facebook refused the performance "
+                    f"reports for {self._dates_failed} date(s) ({why}). The dates that were extracted are in "
                     "the table; the refused ones are not, and the next run picks them up."
                 )
                 internal_logger.warning(
-                    f"[{self.name}] Partial extraction: {self._dates_failed} date(s) failed while "
-                    f"{records_emitted} record(s) were emitted over {batches_attempted} batch(es) and "
+                    f"[{self.name}] Partial extraction with a bookmark: {self._dates_failed} date(s) failed "
+                    f"while {records_emitted} record(s) were emitted over {batches_attempted} batch(es) and "
                     f"{reports_queued} queued report(s). The run stays green; the bookmark is not capped."
                 )
+                return
+            AdsInsightStream._incomplete_without_history.append(self.name)
+            user_logger.error(
+                f"[{self.name}] This extraction was only partial: Facebook refused the performance reports "
+                f"for {self._dates_failed} date(s) ({why}). With no earlier data to add to, the table now "
+                "holds only the dates that were extracted; the next runs continue from the last one. The run "
+                "is marked as failed so this is not mistaken for a complete load."
+            )
+            internal_logger.error(
+                f"[{self.name}] Partial extraction WITHOUT a bookmark (full sync or first sync): "
+                f"{self._dates_failed} date(s) failed, {records_emitted} record(s) emitted over "
+                f"{batches_attempted} batch(es) and {reports_queued} queued report(s). The stream ends normally "
+                "so its bookmark is finalized; the run is failed after every stream has run."
+            )
             return
         if not self._dates_failed and reports_queued:
             # Every date built and returned nothing: the account really is empty.
             return
 
-        if self.get_starting_replication_key_value(self._sync_context):
-            # The table already holds this stream's history and the loader is
-            # adding to it, not replacing it, so emitting nothing cannot erase
-            # anything -- the only cost is that the stream did not advance.
-            # Failing here would be worse than the gap it guards against: three
-            # failed runs in a row disable the pipeline, which stops every other
-            # stream too. So the customer is told plainly and the run ends.
+        if has_history:
             user_logger.warning(
                 f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
-                f"reports for {self._dates_failed} date(s), most often because the ad account's request "
-                "limit was already spent. The data extracted previously is untouched and the next run "
-                "picks up from where it stopped."
+                f"reports for {self._dates_failed} date(s) ({why}). The data extracted previously is "
+                "untouched and the next run picks up from where it stopped."
             )
             internal_logger.warning(
                 f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
-                f"{self._dates_failed} date(s) failed, 0 records emitted; the stream has a bookmark, so the "
-                "run is not failed -- nothing would be overwritten and a failed run would count towards "
-                "disabling the pipeline."
+                f"{self._dates_failed} date(s) failed, 0 records emitted; the stream has a real bookmark, so "
+                "the loader appends and nothing is overwritten -- the run is not failed."
             )
             return
 
         user_logger.error(
-            f"[{self.name}] No data could be extracted in this run and {self._dates_failed} date(s) failed, "
-            "so the existing data was left untouched rather than replaced with an empty result. "
+            f"[{self.name}] No data could be extracted in this run: Facebook refused the performance reports "
+            f"for {self._dates_failed} date(s) ({why}). If this run was a full sync, the table of this stream "
+            "may now be empty. The run stops here so the tables of the remaining streams are not touched. "
             "Please contact Nekt support."
         )
         internal_logger.error(
             f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
-            f"{self._dates_failed} date(s) failed, 0 records emitted; failing the run so the loader does "
-            "not overwrite the table with an empty snapshot."
+            f"{self._dates_failed} date(s) failed, 0 records emitted, and NO bookmark in the state (full sync "
+            "or first sync). Failing now: the destination replaces FULL_TABLE tables even on a failed run "
+            "(target-bigquery-internal swap), so stopping here limits that to this stream."
         )
         sys.exit(1)
 
@@ -1554,7 +1710,7 @@ class AdsInsightStream(FacebookSDKStream):
             next_date = self._advance_date(current_date, time_increment)
             span_until = None
             if self._span_mode:
-                next_date = self._advance_batch(current_date, time_increment, SPAN_MAX_SLICES, end_date)
+                next_date = self._advance_batch(current_date, time_increment, self._span_slices, end_date)
                 span_until = min(next_date.subtract(days=1), end_date)
 
             report_label = (
@@ -1957,9 +2113,17 @@ class AdsInsightStream(FacebookSDKStream):
                             return
                         continue
 
+                self._job_too_large = False
                 jobs = self._run_parts_to_completion(parts, report_date)
                 if jobs is None:
                     if span_until is not None:
+                        if self._job_too_large and self._shrink_span_after_too_large(
+                            date_obj, span_until, report_date, time_increment
+                        ):
+                            # Deterministic, so no retry at the same width: each
+                            # one would be another creation spent on a report
+                            # Facebook already said it cannot build.
+                            return
                         if attempt < span_attempts and not self._throttled:
                             # One more try before giving the shape up: most job
                             # failures on a healthy account are transient.
@@ -2400,6 +2564,13 @@ class AdsInsightStream(FacebookSDKStream):
             code = int(fields["error_code"])
         except (KeyError, TypeError, ValueError):
             code = None
+        try:
+            subcode = int(fields["error_subcode"])
+        except (KeyError, TypeError, ValueError):
+            subcode = None
+        if subcode in REPORT_TOO_LARGE_SUBCODES:
+            self._job_too_large = True
+            self._report_too_large_seen = True
         if code in ACCOUNT_THROTTLE_ERROR_CODES:
             self._throttled = True
         elif code in APP_THROTTLE_ERROR_CODES:
@@ -2510,8 +2681,7 @@ class AdsInsightStream(FacebookSDKStream):
         user_logger.error(
             f"[{self.name}] Facebook built {len(built)} of {len(parts)} smaller reports covering {report_label}, "
             f"but not: {', '.join(missing) or 'unknown'}. The period was left for the next scheduled run rather "
-            "than written with those columns empty. Asking for it one day at a time would only spend the "
-            "account's request limit on reports that fail the same way."
+            "than written with those columns empty."
         )
         internal_logger.error(
             f"[{self.name}] act_{self.config.get('account_id')}: split window {report_label} given up after "
@@ -2679,6 +2849,7 @@ class AdsInsightStream(FacebookSDKStream):
         self._reset_run_state()
         self._sync_context = context
         self._restore_split_mode(context)
+        self._restore_span_width(context)
         batches_attempted = 0
         reports_queued = 0
         records_emitted = 0
@@ -2739,7 +2910,7 @@ class AdsInsightStream(FacebookSDKStream):
                     # Nothing queued: skip the whole span this batch just tried,
                     # not a single date -- otherwise every date is re-requested
                     # up to batch_size times before the window moves past it.
-                    attempted = SPAN_MAX_SLICES if self._span_mode else batch_size
+                    attempted = self._span_slices if self._span_mode else batch_size
                     report_date = self._advance_batch(report_date, time_increment, attempted, sync_end_date)
                     continue
 
@@ -2783,8 +2954,16 @@ class AdsInsightStream(FacebookSDKStream):
                     # (TJaE, 17/09/2026).
                     self._dates_failed += 1
                     self._warn_throttle_is_unrecoverable()
-                    attempted = SPAN_MAX_SLICES if self._span_mode else batch_size
+                    attempted = self._span_slices if self._span_mode else batch_size
                     report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
+                    continue
+
+                if self._span_resize_from is not None:
+                    # Facebook said the window was too large. Nothing was
+                    # emitted for it, so the same dates are asked for again in
+                    # the narrower windows _shrink_span_after_too_large chose.
+                    report_date = self._span_resize_from
+                    self._span_resize_from = None
                     continue
 
                 if self._span_failed_from is not None:

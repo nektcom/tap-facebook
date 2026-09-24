@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import sys
 import typing as t
 from datetime import datetime, timezone
 
 from nekt_singer_sdk import Tap
+from nekt_singer_sdk.custom_logger import internal_logger, user_logger
 from nekt_singer_sdk import typing as th
 
 if t.TYPE_CHECKING:
@@ -487,6 +489,33 @@ class TapFacebook(Tap):
             advanced_streams = [stream_class(tap=self) for stream_class in ADVANCED_STREAM_TYPES]
 
         return [*streams, *advanced_streams]
+
+    def sync_all(self, *args, **kwargs) -> None:
+        """Run every stream, then fail the run if an insights stream was partial with no history.
+
+        Such a stream -- a full sync, or a first sync, that extracted some dates
+        and lost others -- ends normally so its bookmark is saved: it is an
+        unsorted stream, so exiting inside it would discard the progress and
+        the next run would start over from the configured start date. The
+        failure is raised here instead, once every stream has run, so a load
+        the destination treated as a full replacement is never reported as a
+        success (see AdsInsightStream._fail_if_nothing_extracted).
+        """
+        AdsInsightStream._incomplete_without_history = []
+        super().sync_all(*args, **kwargs)
+        incomplete = list(AdsInsightStream._incomplete_without_history)
+        if not incomplete:
+            return
+        user_logger.error(
+            f"The extraction finished, but {len(incomplete)} performance report stream(s) were only partly "
+            f"loaded: {', '.join(incomplete)}. The run is marked as failed so the missing dates are not "
+            "mistaken for a complete load; the next runs continue from where these streams stopped."
+        )
+        internal_logger.error(
+            f"Failing the run after sync_all: insights stream(s) {incomplete} extracted part of the period "
+            "with no bookmark in the state (full sync or first sync); their bookmarks were finalized."
+        )
+        sys.exit(1)
 
     def load_streams(self) -> list[FacebookStream]:
         """Order the streams for the sync.

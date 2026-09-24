@@ -119,6 +119,13 @@ class TestTheInsightsStreamsTakeTurnsGoingFirst:
         assert insights_order(tap) == ["adsinsights"]
 
 
+def with_bookmark(stream: AdsInsightStream, value: str = "2026-09-09") -> AdsInsightStream:
+    """Give the stream the finalized bookmark a previous incremental run leaves behind."""
+    stream.stream_state["replication_key"] = "date_start"
+    stream.stream_state["replication_key_value"] = value
+    return stream
+
+
 class TestAStreamWithHistoryWarnsInsteadOfFailingTheRun:
     def stream(self) -> AdsInsightStream:
         stream = make_tap().streams["adsinsights"]
@@ -128,22 +135,16 @@ class TestAStreamWithHistoryWarnsInsteadOfFailingTheRun:
         return stream
 
     def test_a_stream_that_already_has_a_bookmark_does_not_fail_the_run(self):
-        stream = self.stream()
-        with (
-            mock.patch.object(stream, "get_starting_replication_key_value", return_value="2026-09-09"),
-            mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged,
-        ):
+        stream = with_bookmark(self.stream())
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
             stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=1, records_emitted=0)
 
         assert logged.warning.called
         assert not logged.error.called
 
     def test_the_customer_is_told_the_stream_did_not_advance(self):
-        stream = self.stream()
-        with (
-            mock.patch.object(stream, "get_starting_replication_key_value", return_value="2026-09-09"),
-            mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged,
-        ):
+        stream = with_bookmark(self.stream())
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
             stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=1, records_emitted=0)
 
         said = logged.warning.call_args.args[0]
@@ -153,24 +154,24 @@ class TestAStreamWithHistoryWarnsInsteadOfFailingTheRun:
     def test_a_first_sync_with_no_bookmark_still_fails(self):
         """No bookmark means the load replaces the table; empty would erase it."""
         stream = self.stream()
-        with (
-            mock.patch.object(stream, "get_starting_replication_key_value", return_value=None),
-            pytest.raises(SystemExit),
-        ):
+        with pytest.raises(SystemExit):
             stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=1, records_emitted=0)
 
-    def test_a_run_that_extracted_rows_is_untouched(self):
+    def test_a_run_that_extracted_everything_is_untouched(self):
         stream = self.stream()
-        with mock.patch.object(stream, "get_starting_replication_key_value") as bookmark:
+        stream._dates_failed = 0
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
             stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=1, records_emitted=10)
-        bookmark.assert_not_called()
+        assert not logged.warning.called
+        assert not logged.error.called
 
     def test_an_account_that_simply_had_no_delivery_is_untouched(self):
         stream = self.stream()
         stream._dates_failed = 0
-        with mock.patch.object(stream, "get_starting_replication_key_value") as bookmark:
+        with mock.patch("tap_facebook.streams.ad_insights.user_logger") as logged:
             stream._fail_if_nothing_extracted(batches_attempted=1, reports_queued=1, records_emitted=0)
-        bookmark.assert_not_called()
+        assert not logged.warning.called
+        assert not logged.error.called
 
 
 class TestTheWholeReportIsInsistedOnBeforePayingForParts:
@@ -222,7 +223,9 @@ class TestAPartiallyExtractedStreamIsAnnounced:
         stream = make_tap().streams["adsinsights"]
         stream._reset_run_state()
         stream._sync_context = None
-        return stream
+        # An incremental run: the table is appended to. The full-sync case,
+        # where it is replaced, is covered in test_insights_full_sync_guard.py.
+        return with_bookmark(stream)
 
     def test_the_customer_is_told_when_some_dates_were_refused(self):
         stream = self.stream()
