@@ -607,6 +607,31 @@ def _columns_named_in_error(message: str, columns: list[str]) -> list[str]:
     return [column for column in columns if column in tokens]
 
 
+# A read that names columns the built report does not hold is answered with
+# "(#100) Cannot include cost_per_objective_result, objective_results in fields
+# param because they weren't there while creating the report run. All available
+# values are: account_id, ad_id, ..." -- Facebook left those fields out when it
+# created the report, although the request asked for them. Only the names before
+# "in fields param" are the culprits; everything after "All available values"
+# is the report's own field list, keys included. Read as one list of names, the
+# message looks like an echo of the whole request, so until v1.83 the re-read
+# gave up and the stream recreated a report it only had to read again: two or
+# three creations per window on the accounts that refuse adset_start/adset_end,
+# the same accounts that then ran out of quota (44 pipelines, 24/09/2026).
+_ABSENT_FROM_REPORT = re.compile(
+    r"Cannot include (?P<names>.+?) in fields param because they weren.t there while creating the report run"
+)
+
+
+def _columns_absent_from_report(message: str, columns: list[str]) -> list[str]:
+    """Return the requested columns Facebook says the built report does not hold."""
+    match = _ABSENT_FROM_REPORT.search(message)
+    if not match:
+        return []
+    tokens = set(_WORD_TOKEN.findall(match.group("names")))
+    return [column for column in columns if column in tokens]
+
+
 class AdsInsightStream(FacebookSDKStream):
     name = "adsinsights"
     replication_key = "date_start"
@@ -1242,11 +1267,42 @@ class AdsInsightStream(FacebookSDKStream):
 
         self._rejected_columns = rejected
         self._restart_from = date_obj
+        # The account refuses these at read whatever the report, so the other
+        # streams of the run leave them out up front instead of each paying the
+        # same recreation. Until v1.83 only a successful re-read shared them.
+        AdsInsightStream._columns_refused_on_read.update(rejected)
         internal_logger.warning(
             f"[{self.name}] Graph API refused {len(rejected)} column(s) while reading the report "
             f"for {report_date}: {message}. Restarting from this date without them."
         )
         return True
+
+    def _what_a_read_refusal_leaves_out(
+        self,
+        message: str,
+        columns: list[str],
+        report_date: str,
+    ) -> tuple[list[str], list[str]] | None:
+        """Split a #100 on a read into (refused, absent) columns, or None when it cannot be trusted.
+
+        `refused` are columns this account will not serve ("nonexisting summary
+        field"): they are remembered for the rest of the run and the customer is
+        told they arrive empty. `absent` are columns this particular report was
+        built without ("weren't there while creating the report run"): they hold
+        no data in it either way, so they are only left out of this read.
+        """
+        if absent := _columns_absent_from_report(message, columns):
+            if protected := set(absent) & _columns_never_dropped(self):
+                internal_logger.warning(
+                    f"[{self.name}] Read of {report_date} says key column(s) ({', '.join(sorted(protected))}) "
+                    f"are not in the report; nothing is left out. Original error: {message}"
+                )
+                return None
+            return [], absent
+        refused = self._refused_columns_safe_to_drop(message, columns, report_date)
+        if not refused:
+            return None
+        return refused, []
 
     def _reread_without_refused_columns(
         self,
@@ -1268,26 +1324,33 @@ class AdsInsightStream(FacebookSDKStream):
         against a live report that answers #100 when read with no field list.
 
         Facebook names one column at a time, so this keeps narrowing and
-        re-reading until the read succeeds. Returns the rows on success, or None
-        when this is not a refusal it can absorb -- the caller then falls back to
-        the slower path that recreates the report.
+        re-reading until the read succeeds. A read that names columns the report
+        was built without is narrowed the same way (see
+        `_columns_absent_from_report`) -- that is the answer to the second read on
+        the accounts that refuse adset_start/adset_end. Returns the rows on
+        success, or None when this is not a refusal it can absorb -- the caller
+        then falls back to the slower path that recreates the report.
         """
         if fb_err.api_error_code() != FIELDS_PARAM_ERROR_CODE:
             return None
 
         message = fb_err.api_error_message() or str(fb_err)
-        refused = self._refused_columns_safe_to_drop(message, columns, report_date)
-        if not refused:
+        # What the account already refused in this run stays out of every read.
+        remaining = [column for column in columns if column not in AdsInsightStream._columns_refused_on_read]
+        narrowing = self._what_a_read_refusal_leaves_out(message, remaining, report_date)
+        if narrowing is None:
             return None
+        refused, absent = narrowing
 
-        remaining = list(columns)
         dropped: list[str] = []
+        left_out: list[str] = []
         # One pass per column is the worst case; the guard is the loop's bound,
         # not a retry budget -- every pass strictly shrinks `remaining`.
         for _ in range(len(columns)):
             dropped.extend(refused)
-            refused_set = set(refused)
-            remaining = [column for column in remaining if column not in refused_set]
+            left_out.extend(absent)
+            excluded = set(refused) | set(absent)
+            remaining = [column for column in remaining if column not in excluded]
             if not remaining:
                 # Nothing left to ask for: let the caller's path report it.
                 return None
@@ -1305,23 +1368,42 @@ class AdsInsightStream(FacebookSDKStream):
                 retry_message = retry_err.api_error_message() or str(retry_err)
                 # Asked again, keys included: a later pass is just as likely to
                 # come back with the whole field list as the first one.
-                refused = self._refused_columns_safe_to_drop(retry_message, remaining, report_date)
-                if not refused:
+                narrowing = self._what_a_read_refusal_leaves_out(retry_message, remaining, report_date)
+                if narrowing is None:
                     return None
+                refused, absent = narrowing
                 continue
 
-            AdsInsightStream._columns_refused_on_read.update(dropped)
-            user_logger.warning(
-                f"[{self.name}] Facebook accepted {len(dropped)} metric(s) when the report was requested "
-                f"and then refused to return them for this ad account: {', '.join(sorted(dropped))}. "
-                "The remaining metrics were extracted normally and these columns arrive empty; the next "
-                "run checks them again."
-            )
-            internal_logger.warning(
-                f"[{self.name}] Re-read report(s) {[part['report_run_id'] for part in parts]} for "
-                f"{report_date} without {len(dropped)} refused column(s) ({', '.join(sorted(dropped))}) "
-                f"instead of recreating them; {len(remaining)} column(s) served. Original error: {message}"
-            )
+            report_ids = [part["report_run_id"] for part in parts]
+            if dropped:
+                AdsInsightStream._columns_refused_on_read.update(dropped)
+                user_logger.warning(
+                    f"[{self.name}] Facebook accepted {len(dropped)} metric(s) when the report was requested "
+                    f"and then refused to return them for this ad account: {', '.join(sorted(dropped))}. "
+                    "The remaining metrics were extracted normally and these columns arrive empty; the next "
+                    "run checks them again."
+                )
+                internal_logger.warning(
+                    f"[{self.name}] Re-read report(s) {report_ids} for {report_date} without "
+                    f"{len(dropped)} refused column(s) ({', '.join(sorted(dropped))}) instead of recreating "
+                    f"them; {len(left_out)} column(s) the report was built without also left out "
+                    f"({', '.join(sorted(left_out)) or 'none'}); {len(remaining)} column(s) served. "
+                    f"Original error: {message}"
+                )
+            else:
+                # Nothing changes for the customer: the report never held these
+                # columns, so they were going to arrive empty anyway. Every window
+                # of the stream hits this once, so only the first is an info.
+                detail = (
+                    f"[{self.name}] Re-read report(s) {report_ids} for {report_date} leaving out "
+                    f"{len(left_out)} column(s) the report was built without ({', '.join(sorted(left_out))}); "
+                    f"{len(remaining)} column(s) served. Original error: {message}"
+                )
+                if getattr(self, "_absent_on_read_logged", False):
+                    internal_logger.debug(detail)
+                else:
+                    self._absent_on_read_logged = True
+                    internal_logger.info(detail)
             return rows
 
         return None
@@ -2954,6 +3036,18 @@ class AdsInsightStream(FacebookSDKStream):
                     # (TJaE, 17/09/2026).
                     self._dates_failed += 1
                     self._warn_throttle_is_unrecoverable()
+                    if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
+                        # Same reason as a window that could not be queued at
+                        # all: skipping to the next window leaves this one
+                        # behind the bookmark as a hole if the quota frees up and
+                        # a later window builds. Nine skips on v1.80/1.81 in the
+                        # week to 24/09/2026, none followed by a build -- yet.
+                        internal_logger.warning(
+                            f"[{self.name}] Account budget spent at {resume_from} while retrying; ending the "
+                            f"stream here instead of skipping the window. The {records_emitted} record(s) "
+                            "already extracted are kept and the next run resumes from them."
+                        )
+                        break
                     attempted = self._span_slices if self._span_mode else batch_size
                     report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
                     continue
