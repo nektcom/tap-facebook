@@ -36,6 +36,26 @@ from tap_facebook.streams import (
 )
 from tap_facebook.streams.creative import creative_files_enabled
 
+
+def _state_has_a_bookmark(state: dict | None) -> bool:
+    """Whether the state handed to this run holds a finalized bookmark for any stream.
+
+    Meltano passes no state at all on a full refresh, and a new pipeline has
+    none yet; any other run carries the bookmarks of the streams that have
+    completed before. Only `replication_key_value` counts: the SDK's own
+    `starting_replication_value` and progress markers are not a bookmark.
+    """
+    for stream_state in ((state or {}).get("bookmarks") or {}).values():
+        if not isinstance(stream_state, dict):
+            continue
+        if stream_state.get("replication_key_value") not in (None, ""):
+            return True
+        for partition in stream_state.get("partitions") or []:
+            if isinstance(partition, dict) and partition.get("replication_key_value") not in (None, ""):
+                return True
+    return False
+
+
 STREAM_TYPES = [
     AdsInsightStream,
     AdsetsStream,
@@ -491,10 +511,11 @@ class TapFacebook(Tap):
         return [*streams, *advanced_streams]
 
     def sync_all(self, *args, **kwargs) -> None:
-        """Run every stream, then fail the run if an insights stream was partial with no history.
+        """Run every stream, then fail the run if an insights stream was partial on a replaced table.
 
-        Such a stream -- a full sync, or a first sync, that extracted some dates
-        and lost others -- ends normally so its bookmark is saved: it is an
+        Such a stream -- on a full sync, a pipeline's first run or a FULL_TABLE
+        stream, where the destination swaps the table for what the run extracted
+        -- that got some dates and lost others ends normally so its bookmark is saved: it is an
         unsorted stream, so exiting inside it would discard the progress and
         the next run would start over from the configured start date. The
         failure is raised here instead, once every stream has run, so a load
@@ -502,6 +523,17 @@ class TapFacebook(Tap):
         success (see AdsInsightStream._fail_if_nothing_extracted).
         """
         AdsInsightStream._incomplete_without_history = []
+        # Read before any stream runs: the streams add bookmarks to this same
+        # state as they go, so later it no longer tells what the run was handed.
+        AdsInsightStream._run_started_without_state = not _state_has_a_bookmark(self.state)
+        internal_logger.info(
+            "Insights load mode: "
+            + (
+                "no bookmark handed in (full sync or first run) -- a short insights stream fails the run."
+                if AdsInsightStream._run_started_without_state
+                else "incremental -- a short insights stream only warns."
+            )
+        )
         super().sync_all(*args, **kwargs)
         incomplete = list(AdsInsightStream._incomplete_without_history)
         if not incomplete:
@@ -513,7 +545,7 @@ class TapFacebook(Tap):
         )
         internal_logger.error(
             f"Failing the run after sync_all: insights stream(s) {incomplete} extracted part of the period "
-            "with no bookmark in the state (full sync or first sync); their bookmarks were finalized."
+            "on a table the destination replaces (full sync, first run or FULL_TABLE); their bookmarks were finalized."
         )
         sys.exit(1)
 

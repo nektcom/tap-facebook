@@ -618,8 +618,12 @@ def _columns_named_in_error(message: str, columns: list[str]) -> list[str]:
 # gave up and the stream recreated a report it only had to read again: two or
 # three creations per window on the accounts that refuse adset_start/adset_end,
 # the same accounts that then ran out of quota (44 pipelines, 24/09/2026).
+# Facebook words it in the singular for one field ("Cannot include social_spend
+# in fields param because it wasn't there ..."): 89 of the 487 such answers in
+# the week to 2026-09-24, which v1.83 still answered by recreating the report.
 _ABSENT_FROM_REPORT = re.compile(
-    r"Cannot include (?P<names>.+?) in fields param because they weren.t there while creating the report run"
+    r"Cannot include (?P<names>.+?) in fields param because (?:they weren.t|it wasn.t) there "
+    r"while creating the report run"
 )
 
 
@@ -670,6 +674,16 @@ class AdsInsightStream(FacebookSDKStream):
     # so an exit mid-stream would throw the progress away) and the tap fails the
     # run once every stream is done; see TapFacebook.sync_all.
     _incomplete_without_history: list[str] = []  # noqa: RUF012
+
+    # Whether this run was handed no bookmark at all. Meltano passes no state on
+    # a full refresh (nekt-connectors-engine, SingerTap.look_up_state), and a
+    # brand-new pipeline has none yet: those are the runs whose tables the
+    # destination replaces with what the run extracted. A run that does carry
+    # state and meets a stream with no bookmark of its own -- a stream the
+    # customer just enabled, or a new source from its second run on -- is an
+    # incremental load that the destination merges. Set by TapFacebook.sync_all
+    # from the state it received; True until then, the cautious reading.
+    _run_started_without_state: bool = True
 
     @property
     def effective_granularity(self) -> str:
@@ -1112,6 +1126,22 @@ class AdsInsightStream(FacebookSDKStream):
             return False
         return state.get("replication_key_value") not in (None, "")
 
+    def _loader_replaces_the_table(self) -> bool:
+        """Whether the destination swaps this stream's table for what this run extracted.
+
+        A FULL_TABLE stream is replaced on every run, bookmark or not. An
+        incremental stream is replaced only on a run that was handed no state
+        at all -- a full sync or a pipeline's first run. On any other run the
+        destination merges, so a stream without a bookmark of its own (just
+        enabled, or a new source still filling its first periods) loses
+        nothing by coming back short: until v1.84 such a stream failed every
+        run until each insights stream had a bookmark, and three failures in a
+        row disable the pipeline (facebook-ads-p5eD and -659m, 2026-09-24).
+        """
+        if self.replication_method == REPLICATION_FULL_TABLE:
+            return True
+        return AdsInsightStream._run_started_without_state and not self._has_history()
+
     def _why_reports_were_refused(self) -> str:
         """The cause to name to the customer, from what this run actually saw."""
         if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
@@ -1128,14 +1158,15 @@ class AdsInsightStream(FacebookSDKStream):
     ) -> None:
         """Decide how a stream that lost dates ends: warn, fail at the end, or fail now.
 
-        With history (a real bookmark) the loader adds to the table, so a gap
+        When the destination merges (see `_loader_replaces_the_table`) a gap
         costs nothing that the next run cannot fill: the stream warns and the
         run stays green (three red runs in a row would disable the pipeline and
-        stop every other stream too).
+        stop every other stream too). That holds for a stream with a real
+        bookmark and for one that has none yet on a run that did carry state.
 
-        Without history -- a full sync, or a first sync -- the destination
-        replaces the table with what this run extracted. Then a gap is a real
-        failure and is never reported as a success:
+        When the destination replaces the table with what this run extracted --
+        a full sync, a pipeline's first run, or a FULL_TABLE stream -- a gap is a
+        real failure and is never reported as a success:
         - some rows: the stream finishes normally so its bookmark is saved and
           the next runs continue from it; the tap fails the run once every
           stream is done (TapFacebook.sync_all);
@@ -1148,20 +1179,22 @@ class AdsInsightStream(FacebookSDKStream):
         if not batches_attempted:
             return
         has_history = self._has_history()
+        replaced = self._loader_replaces_the_table()
         why = self._why_reports_were_refused()
         if records_emitted:
             if not self._dates_failed:
                 return
-            if has_history:
+            if not replaced:
                 user_logger.warning(
                     f"[{self.name}] This stream was only partially updated: Facebook refused the performance "
                     f"reports for {self._dates_failed} date(s) ({why}). The dates that were extracted are in "
                     "the table; the refused ones are not, and the next run picks them up."
                 )
                 internal_logger.warning(
-                    f"[{self.name}] Partial extraction with a bookmark: {self._dates_failed} date(s) failed "
-                    f"while {records_emitted} record(s) were emitted over {batches_attempted} batch(es) and "
-                    f"{reports_queued} queued report(s). The run stays green; the bookmark is not capped."
+                    f"[{self.name}] Partial extraction on a merged load (bookmark: {has_history}): "
+                    f"{self._dates_failed} date(s) failed while {records_emitted} record(s) were emitted over "
+                    f"{batches_attempted} batch(es) and {reports_queued} queued report(s). The run stays green; "
+                    "the bookmark is not capped."
                 )
                 return
             AdsInsightStream._incomplete_without_history.append(self.name)
@@ -1172,7 +1205,7 @@ class AdsInsightStream(FacebookSDKStream):
                 "is marked as failed so this is not mistaken for a complete load."
             )
             internal_logger.error(
-                f"[{self.name}] Partial extraction WITHOUT a bookmark (full sync or first sync): "
+                f"[{self.name}] Partial extraction on a replaced table (full sync, first run or FULL_TABLE): "
                 f"{self._dates_failed} date(s) failed, {records_emitted} record(s) emitted over "
                 f"{batches_attempted} batch(es) and {reports_queued} queued report(s). The stream ends normally "
                 "so its bookmark is finalized; the run is failed after every stream has run."
@@ -1182,19 +1215,38 @@ class AdsInsightStream(FacebookSDKStream):
             # Every date built and returned nothing: the account really is empty.
             return
 
-        if has_history:
-            user_logger.warning(
-                f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
-                f"reports for {self._dates_failed} date(s) ({why}). The data extracted previously is "
-                "untouched and the next run picks up from where it stopped."
-            )
+        if not replaced:
+            if has_history:
+                user_logger.warning(
+                    f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
+                    f"reports for {self._dates_failed} date(s) ({why}). The data extracted previously is "
+                    "untouched and the next run picks up from where it stopped."
+                )
+            else:
+                user_logger.warning(
+                    f"[{self.name}] This stream has no data yet: Facebook refused the performance reports for "
+                    f"{self._dates_failed} date(s) ({why}). Nothing was written for it in this run; the next "
+                    "run tries again from the configured start date."
+                )
             internal_logger.warning(
                 f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
-                f"{self._dates_failed} date(s) failed, 0 records emitted; the stream has a real bookmark, so "
-                "the loader appends and nothing is overwritten -- the run is not failed."
+                f"{self._dates_failed} date(s) failed, 0 records emitted; merged load (bookmark: {has_history}), "
+                "so the loader appends and nothing is overwritten -- the run is not failed."
             )
             return
 
+        # The width the window was cut to (and the split-mode marker) live in the
+        # stream state, which the SDK only emits when the stream ends. Exiting
+        # here would drop them and the next run would pay the same cuts again.
+        try:
+            # The markers were written straight into the state dict, which the
+            # SDK does not count as a change; mark it dirty so it is emitted.
+            self._is_state_flushed = False
+            self._write_state_message()
+        except Exception:  # noqa: BLE001 -- never let the state write keep the run from failing
+            internal_logger.warning(
+                f"[{self.name}] Could not emit the stream state before failing the run.", exc_info=True
+            )
         user_logger.error(
             f"[{self.name}] No data could be extracted in this run: Facebook refused the performance reports "
             f"for {self._dates_failed} date(s) ({why}). If this run was a full sync, the table of this stream "
@@ -1203,8 +1255,8 @@ class AdsInsightStream(FacebookSDKStream):
         )
         internal_logger.error(
             f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
-            f"{self._dates_failed} date(s) failed, 0 records emitted, and NO bookmark in the state (full sync "
-            "or first sync). Failing now: the destination replaces FULL_TABLE tables even on a failed run "
+            f"{self._dates_failed} date(s) failed, 0 records emitted, and the destination replaces this table "
+            "(full sync, first run or FULL_TABLE). Failing now: the destination replaces FULL_TABLE tables even on a failed run "
             "(target-bigquery-internal swap), so stopping here limits that to this stream."
         )
         sys.exit(1)
@@ -1373,6 +1425,17 @@ class AdsInsightStream(FacebookSDKStream):
                     return None
                 refused, absent = narrowing
                 continue
+            except Exception:  # noqa: BLE001
+                # This runs inside the caller's `except FacebookRequestError`, so
+                # anything raised here -- a dropped connection, a read timeout, a
+                # page that does not decode -- would skip the caller's retries and
+                # take the whole stream down. Hand it back as "not absorbed".
+                internal_logger.warning(
+                    f"[{self.name}] Re-reading report(s) {[part['report_run_id'] for part in parts]} for "
+                    f"{report_date} failed with a non-Graph error; falling back to the usual path.",
+                    exc_info=True,
+                )
+                return None
 
             report_ids = [part["report_run_id"] for part in parts]
             if dropped:
@@ -2655,6 +2718,10 @@ class AdsInsightStream(FacebookSDKStream):
             self._report_too_large_seen = True
         if code in ACCOUNT_THROTTLE_ERROR_CODES:
             self._throttled = True
+            # Recorded like a refused creation, so the stream ends at the spent
+            # budget instead of skipping the window, and the customer is told
+            # the real cause.
+            self._last_throttle_code = code
         elif code in APP_THROTTLE_ERROR_CODES:
             # Shared, short-lived: the normal retry (with its wait) is the right
             # answer, not giving the window up as if the account were spent.
