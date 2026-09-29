@@ -276,6 +276,16 @@ class TapFacebook(Tap):
             default=False,
         ),
         th.Property(
+            "include_insights_instagram_fields",
+            th.BooleanType,
+            description=(
+                "Adds Instagram profile visits and Instagram follows attributed to "
+                "the ads to Ads Insights. They are requested in the same report as "
+                "the core metrics, so enabling them costs no extra report."
+            ),
+            default=False,
+        ),
+        th.Property(
             "creative_fields_mode",
             th.StringType,
             description=(

@@ -270,6 +270,29 @@ ATTRIBUTION_FIELDS = [
     "attribution_setting",
 ]
 
+# Instagram profile metrics attributed to the ads (NEKT-5558). Opt-in, so a
+# source that does not ask for them keeps the exact schema and request it had.
+# `instagram_profile_visits` is ALSO in STANDARD_FIELDS and must stay there:
+# removing it would drop the column for sources that already have it.
+# Neither field is in Meta's Ads Insights reference. Verified live on
+# 2026-09-29: v25.0 serves both on a sync GET and in an async level=ad report
+# with time_increment=1 (Job Completed, both keys in every row), identical to
+# v26.0.
+INSTAGRAM_FIELDS = [
+    "instagram_profile_visits",
+    "instagram_profile_follow",
+]
+
+# Fields the Graph API serves at the tap's API version but the installed
+# facebook-business SDK does not list yet, with the SDK type they would have.
+# `instagram_profile_follow` first appears in facebook-business 26.0.0 (API
+# v26.0), and the tap stays on 25.x on purpose (see client.py: moving the SDK
+# moves the Graph API version of every source). An entry here is only a type
+# the SDK lacks. It is never requested unless its group is enabled.
+EXTRA_FIELD_TYPES: dict[str, str] = {
+    "instagram_profile_follow": "string",
+}
+
 # Fields the installed SDK exposes but the Graph API refuses, with the reason it
 # gave when asked (checked against v25.0 for NEKT-4527).
 #
@@ -878,16 +901,23 @@ class AdsInsightStream(FacebookSDKStream):
         Returns (core, {group label: columns}). A column that belongs to no
         group stays with the core: it is not what makes a report heavy, and a
         part of one unknown column is not worth a creation of its own.
+
+        A column is owned by the first ENABLED group that lists it, so a field
+        shared by two groups (instagram_profile_visits is in STANDARD and
+        INSTAGRAM) goes with the group that actually brought it in. With no
+        shared fields among the other groups, this is the same owner as
+        before. Columns of CORE_FIELD_GROUPS stay with the core.
         """
         basic_set = set(BASIC_FIELDS)
+        enabled = self.enabled_field_groups
         core: list[str] = []
         grouped: dict[str, list[str]] = {}
         for column in columns:
             if column in basic_set:
                 core.append(column)
                 continue
-            owner = next((key for key, group in self.OPTIONAL_FIELD_GROUPS.items() if column in group), None)
-            if owner is None:
+            owner = next((key for key in enabled if column in self.OPTIONAL_FIELD_GROUPS[key]), None)
+            if owner is None or owner in self.CORE_FIELD_GROUPS:
                 core.append(column)
                 continue
             label = owner.removeprefix("include_insights_").removesuffix("_fields")
@@ -1580,7 +1610,14 @@ class AdsInsightStream(FacebookSDKStream):
         "include_insights_beta_fields": BETA_FIELDS,
         "include_insights_results_fields": RESULTS_FIELDS,
         "include_insights_attribution_fields": ATTRIBUTION_FIELDS,
+        "include_insights_instagram_fields": INSTAGRAM_FIELDS,
     }
+
+    # Groups that travel with the core metrics instead of becoming a report of
+    # their own in split mode. A part costs one report creation per period out
+    # of the ad account's #613 budget, and two plain counters are not what
+    # makes a report too heavy to build.
+    CORE_FIELD_GROUPS: t.ClassVar[frozenset[str]] = frozenset({"include_insights_instagram_fields"})
 
     # The titles these settings carry in nekt.config.json, so the customer reads
     # the name they see in the source form rather than a config key.
@@ -1591,6 +1628,7 @@ class AdsInsightStream(FacebookSDKStream):
         "include_insights_beta_fields": "Ads Insights: Include beta metrics",
         "include_insights_results_fields": "Ads Insights: Include objective-based results metrics",
         "include_insights_attribution_fields": "Ads Insights: Include SKAN and attribution metrics",
+        "include_insights_instagram_fields": "Ads Insights: Include Instagram profile metrics",
     }
 
     @property
@@ -1602,10 +1640,11 @@ class AdsInsightStream(FacebookSDKStream):
     def insights_fields(self) -> list[str]:
         """Insights fields to request: BASIC_FIELDS plus any enabled group.
 
-        Filtered against the installed SDK so a field retired upstream is
-        skipped rather than raising, and de-duplicated while preserving order.
+        Filtered against the installed SDK (plus EXTRA_FIELD_TYPES) so a field
+        retired upstream is skipped rather than raising, and de-duplicated
+        while preserving order.
         """
-        available = AdsInsights._field_types  # noqa: SLF001
+        available = self._insights_field_types()
         selected: list[str] = list(BASIC_FIELDS)
         for key in self.enabled_field_groups:
             selected.extend(self.OPTIONAL_FIELD_GROUPS[key])
@@ -1626,8 +1665,17 @@ class AdsInsightStream(FacebookSDKStream):
             if f in AdsHistogramStats._field_types  # noqa: SLF001
         ]
 
+    @staticmethod
+    def _insights_field_types() -> dict[str, str]:
+        """The installed SDK's insights field types, completed with EXTRA_FIELD_TYPES.
+
+        The SDK wins when it knows a field, so a later SDK bump that adds one
+        of the extras keeps the type Meta generated for it.
+        """
+        return {**EXTRA_FIELD_TYPES, **AdsInsights._field_types}  # noqa: SLF001
+
     def _get_datatype(self, field: str) -> th.Type | None:
-        d_type = AdsInsights._field_types[field]  # noqa: SLF001
+        d_type = self._insights_field_types()[field]
         if d_type == "string":
             return th.StringType()
         if d_type.startswith("list"):
@@ -1661,7 +1709,7 @@ class AdsInsightStream(FacebookSDKStream):
         nothing until someone opts in; this only makes the delta visible and
         names the setting that unlocks each part of it.
         """
-        available = set(AdsInsights._field_types)  # noqa: SLF001
+        available = set(self._insights_field_types())
         known = set(BASIC_FIELDS).union(*self.OPTIONAL_FIELD_GROUPS.values())
 
         gone = sorted(known - available)
@@ -1682,11 +1730,18 @@ class AdsInsightStream(FacebookSDKStream):
         skipped_by_group = {key: fields for key, fields in skipped_by_group.items() if fields}
         if skipped_by_group and not getattr(self, "_optional_groups_logged", False):
             self._optional_groups_logged = True
-            titles = [self.OPTIONAL_FIELD_GROUP_TITLES.get(key, key) for key in skipped_by_group]
-            user_logger.info(
-                f"[{self.name}] Some optional metric groups are not included in this source: "
-                f"{'; '.join(titles)}. They can be enabled in the source's advanced settings."
-            )
+            # CORE_FIELD_GROUPS are left out of the customer line so adding one
+            # does not change the run log of sources that never asked for it.
+            titles = [
+                self.OPTIONAL_FIELD_GROUP_TITLES.get(key, key)
+                for key in skipped_by_group
+                if key not in self.CORE_FIELD_GROUPS
+            ]
+            if titles:
+                user_logger.info(
+                    f"[{self.name}] Some optional metric groups are not included in this source: "
+                    f"{'; '.join(titles)}. They can be enabled in the source's advanced settings."
+                )
             internal_logger.info(
                 f"[{self.name}] {sum(len(v) for v in skipped_by_group.values())} field(s) not requested, by setting: "
                 + " | ".join(f"{key}={','.join(fields)}" for key, fields in skipped_by_group.items())

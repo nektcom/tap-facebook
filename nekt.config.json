@@ -461,6 +461,16 @@
             "docs_url": "https://docs.nekt.com/sources/facebook-ads#ad-insights",
             "description": "Adds SKAdNetwork and attribution setting metrics to Ads Insights. Only enable if attribution is configured on the account -- Facebook may reject the request otherwise."
           },
+          "include_insights_instagram_fields": {
+            "type": "boolean",
+            "order": 31,
+            "title": "Ads Insights: Include Instagram profile metrics",
+            "default": false,
+            "el_type": "extractor",
+            "advanced_settings": true,
+            "docs_url": "https://docs.nekt.com/sources/facebook-ads#ad-insights",
+            "description": "Adds Instagram profile visits (instagram_profile_visits) and Instagram follows (instagram_profile_follow) attributed to the ads to Ads Insights. Requested in the same report as the core metrics, so enabling it costs no extra report."
+          },
           "enable_creative_files_stream": {
             "type": "boolean",
             "order": 27,
