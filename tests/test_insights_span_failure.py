@@ -218,7 +218,9 @@ class TestFacebookReasonIsKept:
             "error_user_msg": "Try again later.",
         }
         assert stream._throttled is True, "a quota code on the job is a throttle"
-        customer_line = user_log.error.call_args.args[0]
+        # A warning since v1.86: the job is retried and the run can end green.
+        assert not user_log.error.called
+        customer_line = user_log.warning.call_args.args[0]
         assert "Facebook says: Report limit reached" in customer_line
         assert "Try again later." in customer_line
         engineer_line = internal_log.error.call_args.args[0]
@@ -234,7 +236,7 @@ class TestFacebookReasonIsKept:
 
         assert stream._last_job_error == {}
         assert stream._throttled is False
-        assert "intermittent error" in user_log.error.call_args.args[0]
+        assert "intermittent error" in user_log.warning.call_args.args[0]
 
 
 class TestPerSliceRetriesAreCapped:

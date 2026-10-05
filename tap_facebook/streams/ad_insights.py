@@ -535,6 +535,14 @@ REPORT_TOO_LARGE_SUBCODES = frozenset({1504045})
 SPAN_WIDTH_STATE_KEY = "insights_span_width"
 SPAN_WIDTH_TTL_DAYS = 7
 
+# When each insights stream was last given a report, as an ISO timestamp in its
+# own state. TapFacebook.sync_all serves the stream that waited longest first:
+# the ad account's "5 calls per 6 hours" budget is spent in stream order, and
+# with an order driven by the clock alone `adsinsights` on facebook-ads-WhFu
+# (seven insights streams) got 0-1 report per run from 2026-09-30 on, while
+# the breakdowns before it stayed current.
+LAST_SERVED_STATE_KEY = "insights_last_served"
+
 # A span job that Facebook fails to build is recreated this many times before
 # the shape is given up on. Most job failures are transient (~14% of jobs die
 # at 0% and succeed on the next attempt), and the arithmetic favours insisting:
@@ -778,6 +786,19 @@ class AdsInsightStream(FacebookSDKStream):
         self._split_mode = False
         self._split_from: pendulum.Date | None = None
         self._sync_context: dict | None = None
+        # The bookmark this run was handed: the floor for the one it finalizes
+        # (see _finalize_state) and where the new dates start (see
+        # _extraction_ranges).
+        self._bookmark_handed_in: pendulum.Date | None = None
+        # Where the account's budget ran out, named in the customer's message.
+        self._budget_spent_at: pendulum.Date | None = None
+        # The lookback re-read runs after the new dates. Dates it could not
+        # re-read were loaded by an earlier run, so they are reported apart
+        # from dates that are really missing.
+        self._rereading = False
+        self._reread_failed = 0
+        self._reread_stopped_at: pendulum.Date | None = None
+        self._served = False
 
     def _note_throttled(self, fb_err: FacebookRequestError, current_date: pendulum.Date) -> None:
         """Record that Facebook refused a report because the quota is spent.
@@ -1090,6 +1111,15 @@ class AdsInsightStream(FacebookSDKStream):
             f"[{self.name}] Starting with {self._span_slices}-slice windows, as found on "
             f"{since.to_date_string()} for this account (Facebook refused wider reports as too large)."
         )
+        # Until v1.86 only the run that cut the window told the customer; the
+        # runs after it went on with narrow windows and no word of why
+        # (facebook-ads-egWh, 2026-10-01 to 10-05).
+        unit = "day(s)" if self._effective_time_increment == 1 else "period(s)"
+        user_logger.info(
+            f"[{self.name}] Asking for reports of {self._span_slices} {unit} each: on {since.to_date_string()} "
+            "Facebook refused larger reports for this account as too large. The full window is tried again "
+            f"from {since.add(days=SPAN_WIDTH_TTL_DAYS + 1).to_date_string()}."
+        )
 
     def _restore_split_mode(self, context: dict | None) -> None:
         """Start in split mode when this process or a recent run already found it necessary."""
@@ -1156,6 +1186,126 @@ class AdsInsightStream(FacebookSDKStream):
             return False
         return state.get("replication_key_value") not in (None, "")
 
+    def _read_bookmark(self) -> pendulum.Date | None:
+        """The finalized bookmark in this stream's state, as a date (None without one)."""
+        try:
+            value = self.get_context_state(self._sync_context).get("replication_key_value")
+        except Exception:  # noqa: BLE001 -- no readable state is no bookmark
+            return None
+        if value in (None, ""):
+            return None
+        try:
+            return pendulum.parse(str(value)).date()
+        except Exception:  # noqa: BLE001 -- an unreadable bookmark is not a floor
+            return None
+
+    def _finalize_state(self, state: dict | None = None) -> None:
+        """Promote this run's bookmark, but never below the one the run was handed.
+
+        The stream is unsorted, so the SDK finalizes the latest date among THIS
+        run's records. A run cut by the account's budget while it was still on
+        days before its bookmark finalizes an older date, and the next run starts
+        earlier still: adsinsights on facebook-ads-WhFu went 30/09 -> 26/09 ->
+        22/09 -> 18/09 -> 14/09 -> 10/09 in five green runs (2026-09-30 to
+        10-02) without loading a single new date. Every day up to the bookmark
+        the run was handed had been loaded by an earlier run, so keeping that
+        bookmark loses nothing.
+        """
+        super()._finalize_state(state)
+        floor = getattr(self, "_bookmark_handed_in", None)
+        if floor is None or not state:
+            return
+        value = state.get("replication_key_value")
+        if value in (None, ""):
+            return
+        try:
+            finalized = pendulum.parse(str(value)).date()
+        except Exception:  # noqa: BLE001 -- leave a value we cannot read to the SDK
+            return
+        if finalized >= floor:
+            return
+        state["replication_key_value"] = floor.to_date_string()
+        internal_logger.info(
+            f"[{self.name}] Bookmark kept at {floor.to_date_string()}: the latest date this run extracted was "
+            f"{finalized.to_date_string()}, before the bookmark it was handed."
+        )
+
+    def _lookback_only_near_today(self) -> bool:
+        """Whether the lookback is limited to recent days and run after the new dates.
+
+        Only for daily slices: a multi-day or monthly `time_increment` buckets
+        rows by the start of each slice, so moving the start would change which
+        days a row adds up.
+        """
+        return self.effective_granularity == "daily" and self._effective_time_increment == 1
+
+    def _extraction_ranges(
+        self, start: pendulum.Date, end: pendulum.Date
+    ) -> list[tuple[pendulum.Date, pendulum.Date, bool]]:
+        """The periods to extract, in order, each as (from, until, rereading).
+
+        The new dates come first and the lookback re-read of days already loaded
+        comes last. When the account's budget runs out mid-run, it is the re-read
+        that waits for the next run -- not the new dates, which the old order
+        (lookback first) could leave out for days on an account short of
+        reports.
+        """
+        bookmark = self._bookmark_handed_in
+        if bookmark is None or not self._lookback_only_near_today() or start >= bookmark or bookmark > end:
+            return [(start, end, False)]
+        return [(bookmark, end, False), (start, bookmark.subtract(days=1), True)]
+
+    def _note_served(self) -> None:
+        """Record, once per run, that this stream got a report (see LAST_SERVED_STATE_KEY)."""
+        if getattr(self, "_served", False):
+            return
+        self._served = True
+        try:
+            state = self.get_context_state(getattr(self, "_sync_context", None))
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not record the serve time in the state.", exc_info=True)
+            return
+        state[LAST_SERVED_STATE_KEY] = pendulum.now("UTC").to_iso8601_string()
+
+    def _note_budget_spent_at(self, date: pendulum.Date) -> None:
+        """Keep where the account's budget ran out: a missing date, or a re-read cut short."""
+        if self._rereading:
+            self._reread_stopped_at = date
+        else:
+            self._budget_spent_at = date
+
+    def _where_the_budget_ran_out(self) -> str:
+        """The sentence naming the date the account's budget ran out, or nothing."""
+        if self._budget_spent_at is None:
+            return ""
+        return (
+            f" The account's report limit ran out at {self._budget_spent_at.to_date_string()}; "
+            "the next run continues from there."
+        )
+
+    def _report_unfinished_reread(self) -> None:
+        """Tell the customer the lookback re-read stopped short, apart from missing dates.
+
+        Those days were loaded by an earlier run, so this is not a gap: only the
+        late-attributed conversions of those days wait for the next run.
+        """
+        if not self._reread_failed and self._reread_stopped_at is None:
+            return
+        where = (
+            f" at {self._reread_stopped_at.to_date_string()} (the account's report limit ran out)"
+            if self._reread_stopped_at is not None
+            else ""
+        )
+        user_logger.info(
+            f"[{self.name}] The new dates were extracted, but the re-read of recent days that were already "
+            f"loaded (the lookback, which picks up conversions attributed late) stopped{where}. Those days "
+            "stay as loaded and are re-read by the next run."
+        )
+        internal_logger.info(
+            f"[{self.name}] Lookback re-read incomplete: {self._reread_failed} date(s) failed, stopped at "
+            f"{self._reread_stopped_at}. Not counted as missing dates."
+        )
+
     def _loader_replaces_the_table(self) -> bool:
         """Whether the destination swaps this stream's table for what this run extracted.
 
@@ -1208,9 +1358,11 @@ class AdsInsightStream(FacebookSDKStream):
         """
         if not batches_attempted:
             return
+        self._report_unfinished_reread()
         has_history = self._has_history()
         replaced = self._loader_replaces_the_table()
         why = self._why_reports_were_refused()
+        stopped = self._where_the_budget_ran_out()
         if records_emitted:
             if not self._dates_failed:
                 return
@@ -1218,7 +1370,7 @@ class AdsInsightStream(FacebookSDKStream):
                 user_logger.warning(
                     f"[{self.name}] This stream was only partially updated: Facebook refused the performance "
                     f"reports for {self._dates_failed} date(s) ({why}). The dates that were extracted are in "
-                    "the table; the refused ones are not, and the next run picks them up."
+                    f"the table; the refused ones are not, and the next run picks them up.{stopped}"
                 )
                 internal_logger.warning(
                     f"[{self.name}] Partial extraction on a merged load (bookmark: {has_history}): "
@@ -1232,7 +1384,7 @@ class AdsInsightStream(FacebookSDKStream):
                 f"[{self.name}] This extraction was only partial: Facebook refused the performance reports "
                 f"for {self._dates_failed} date(s) ({why}). With no earlier data to add to, the table now "
                 "holds only the dates that were extracted; the next runs continue from the last one. The run "
-                "is marked as failed so this is not mistaken for a complete load."
+                f"is marked as failed so this is not mistaken for a complete load.{stopped}"
             )
             internal_logger.error(
                 f"[{self.name}] Partial extraction on a replaced table (full sync, first run or FULL_TABLE): "
@@ -1250,13 +1402,13 @@ class AdsInsightStream(FacebookSDKStream):
                 user_logger.warning(
                     f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
                     f"reports for {self._dates_failed} date(s) ({why}). The data extracted previously is "
-                    "untouched and the next run picks up from where it stopped."
+                    f"untouched and the next run picks up from where it stopped.{stopped}"
                 )
             else:
                 user_logger.warning(
                     f"[{self.name}] This stream has no data yet: Facebook refused the performance reports for "
                     f"{self._dates_failed} date(s) ({why}). Nothing was written for it in this run; the next "
-                    "run tries again from the configured start date."
+                    f"run tries again from the configured start date.{stopped}"
                 )
             internal_logger.warning(
                 f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
@@ -1281,7 +1433,7 @@ class AdsInsightStream(FacebookSDKStream):
             f"[{self.name}] No data could be extracted in this run: Facebook refused the performance reports "
             f"for {self._dates_failed} date(s) ({why}). If this run was a full sync, the table of this stream "
             "may now be empty. The run stops here so the tables of the remaining streams are not touched. "
-            "Please contact Nekt support."
+            f"Please contact Nekt support.{stopped}"
         )
         internal_logger.error(
             f"[{self.name}] {batches_attempted} batch(es) attempted, {reports_queued} report(s) queued, "
@@ -1993,6 +2145,7 @@ class AdsInsightStream(FacebookSDKStream):
                 created.append(
                     {"name": part_name, "columns": part_columns, "report_run_id": response.json()["report_run_id"]}
                 )
+                self._note_served()
 
             except FacebookRequestError as fb_err:
                 message = fb_err.api_error_message() or str(fb_err)
@@ -2095,6 +2248,7 @@ class AdsInsightStream(FacebookSDKStream):
             response = self._request_report_creation(params, label)
             self._check_facebook_api_usage(headers=response._headers)
             if response.status() == HTTPStatus.OK:
+                self._note_served()
                 return response.json()["report_run_id"]
             channel.warning(f"[{self.name}] Failed to queue retry report for {label}")
         except FacebookRequestError as fb_err:
@@ -2728,6 +2882,22 @@ class AdsInsightStream(FacebookSDKStream):
             internal_logger.debug(f"[{self.name}] Sleeping for {state['sleep']} seconds until job is done")
             time.sleep(state["sleep"])
 
+    @staticmethod
+    def _tell_job_failed(line: str, channel: th.Any) -> None:
+        """Name a failed job to the channel: a warning for the customer, who sees it retried.
+
+        A failed job is created again, and a date that still cannot be built is
+        reported once when the stream ends. Shown as an error, the customer read
+        a run that ended green as broken (facebook-ads-egWh, 2026-10-01).
+        """
+        if channel is user_logger:
+            user_logger.warning(
+                f"{line} The report is requested again; dates Facebook still does not build are reported "
+                "when this stream finishes."
+            )
+        else:
+            channel.error(line)
+
     def _record_job_failure(self, job: th.Any, job_id: str, report_date: str, channel: th.Any) -> None:
         """Log why Facebook failed the job, in Facebook's own words.
 
@@ -2753,7 +2923,7 @@ class AdsInsightStream(FacebookSDKStream):
             line += f" Facebook says: {fields['error_user_title']}."
         reason = fields.get("error_user_msg") or fields.get("error_message")
         line += f" {reason}" if reason else " " + JOB_STALE_ERROR_MESSAGE
-        channel.error(line)
+        self._tell_job_failed(line, channel)
         internal_logger.error(
             f"[{self.name}] AdReportRun {job_id} for {report_date} ended as Job Failed on "
             f"act_{self.config.get('account_id')}: "
@@ -2975,13 +3145,25 @@ class AdsInsightStream(FacebookSDKStream):
             report_start = config_start_date
             user_logger.info(f"[{self.name}] Using configured start date as report start filter {report_start}.")
         else:
-            lookback_start_date = incremental_start_date.subtract(days=lookback_window)
+            lookback_start_date = incremental_start_date.subtract(days=lookback_window or 0)
+            report_start = self._lookback_start(incremental_start_date, lookback_window or 0)
+            note = ""
+            if report_start != lookback_start_date:
+                # The lookback exists for conversions Facebook attributes late,
+                # which only change recent days. On a bookmark far behind -- a
+                # backfill, or a stream catching up -- re-reading the week before
+                # it spent most of each run's reports on days already loaded:
+                # facebook-ads-egWh advanced 1-7 days a run on 2024 data
+                # (2026-10-04/05) with 3-day windows and a 7-day lookback.
+                note = (
+                    f" Days older than the last {lookback_window} days are not re-read: they were already "
+                    "loaded and late conversions no longer change them."
+                )
             user_logger.info(
                 f"[{self.name}] Incremental sync, applying lookback '{lookback_window}' to the "
                 f"bookmark start date '{incremental_start_date}'. Syncing "
-                f"reports starting on '{lookback_start_date}'."
+                f"reports starting on '{report_start}'.{note}"
             )
-            report_start = lookback_start_date
 
         # Facebook store metrics maximum of 37 months old. Any time range that
         # older that 37 months from current date would result in 400 Bad request
@@ -2990,12 +3172,26 @@ class AdsInsightStream(FacebookSDKStream):
         today = pendulum.today().date()
         oldest_allowed_start_date = today.subtract(months=37)
         if report_start < oldest_allowed_start_date:
-            report_start = oldest_allowed_start_date
             user_logger.warning(
-                f"[{self.name}] Report start date '{report_start}' is older than 37 months. "
-                f"Using oldest allowed start date '{oldest_allowed_start_date}' instead."
+                f"[{self.name}] Report start date '{report_start}' is older than the 37 months Facebook keeps. "
+                f"Using the oldest allowed start date '{oldest_allowed_start_date}' instead."
             )
+            report_start = oldest_allowed_start_date
         return report_start
+
+    def _lookback_start(self, bookmark: pendulum.Date, lookback_days: int) -> pendulum.Date:
+        """Where an incremental run starts: the lookback, but only over recent days.
+
+        The re-read covers the last `lookback_days` days before today and never
+        starts after the bookmark, so on a bookmark far behind the run simply
+        resumes from it. Only with daily slices (see _lookback_only_near_today);
+        otherwise the full lookback before the bookmark, as before.
+        """
+        full_lookback = bookmark.subtract(days=lookback_days)
+        if not self._lookback_only_near_today():
+            return full_lookback
+        recent = pendulum.today().date().subtract(days=lookback_days)
+        return min(bookmark, max(full_lookback, recent))
 
     def _generate_hash_id(self, adinsight: AdsInsights, report_breakdowns: list[str]):
         # Extract the relevant properties from the AdsInsights object
@@ -3058,162 +3254,191 @@ class AdsInsightStream(FacebookSDKStream):
         reports_queued = 0
         records_emitted = 0
 
-        # Use batch processing for parallel report creation
-        while report_date <= sync_end_date:
-            if retry_count > 10:
-                user_logger.error(f"[{self.name}] Failed to get insights after 10 retries. Stopping execution.")
-                sys.exit(1)
+        # The bookmark this run was handed: the floor _finalize_state keeps and
+        # where the new dates start. Not for FULL_TABLE, whose table is
+        # replaced every run.
+        if self.replication_method != REPLICATION_FULL_TABLE:
+            self._bookmark_handed_in = self._read_bookmark()
+        stop_stream = False
 
-            # Once this account has refused a column, the next reports are not
-            # created with it either: the refusal is a property of the account,
-            # not of the window that happened to discover it.
-            if refused := AdsInsightStream._columns_refused_on_read & set(columns):
-                columns = [column for column in columns if column not in refused]
-
-            try:
-                # Create a batch of reports in parallel
-                batches_attempted += 1
-                batch_reports = self._create_report_batch(
-                    start_date=report_date,
-                    batch_size=batch_size,
-                    end_date=sync_end_date,
-                    columns=columns,
-                    time_increment=time_increment,
+        for range_start, range_end, rereading in self._extraction_ranges(report_date, sync_end_date):
+            self._rereading = rereading
+            failed_before_range = self._dates_failed
+            if rereading:
+                internal_logger.info(
+                    f"[{self.name}] New dates done; re-reading {range_start} to {range_end} (lookback)."
                 )
-                reports_queued += len(batch_reports)
+            report_date = range_start
+            # Use batch processing for parallel report creation
+            while report_date <= range_end:
+                if retry_count > 10:
+                    user_logger.error(f"[{self.name}] Failed to get insights after 10 retries. Stopping execution.")
+                    sys.exit(1)
 
-                if self._rejected_columns:
-                    # Same date, narrower field set. The rejected list only ever
-                    # shrinks `columns`, so this cannot loop forever.
-                    columns, report_date = self._resume_after_rejection(columns, report_date)
-                    continue
+                # Once this account has refused a column, the next reports are not
+                # created with it either: the refusal is a property of the account,
+                # not of the window that happened to discover it.
+                if refused := AdsInsightStream._columns_refused_on_read & set(columns):
+                    columns = [column for column in columns if column not in refused]
 
-                if not batch_reports:
-                    if self._throttled:
-                        # The window is already one request; there is no smaller
-                        # shape left to ask for. A refused window is a failed
-                        # window, not an empty one.
+                try:
+                    # Create a batch of reports in parallel
+                    batches_attempted += 1
+                    batch_reports = self._create_report_batch(
+                        start_date=report_date,
+                        batch_size=batch_size,
+                        end_date=range_end,
+                        columns=columns,
+                        time_increment=time_increment,
+                    )
+                    reports_queued += len(batch_reports)
+
+                    if self._rejected_columns:
+                        # Same date, narrower field set. The rejected list only ever
+                        # shrinks `columns`, so this cannot loop forever.
+                        columns, report_date = self._resume_after_rejection(columns, report_date)
+                        continue
+
+                    if not batch_reports:
+                        if self._throttled:
+                            # The window is already one request; there is no smaller
+                            # shape left to ask for. A refused window is a failed
+                            # window, not an empty one.
+                            self._dates_failed += 1
+                            self._warn_throttle_is_unrecoverable()
+                            if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
+                                # The spent budget belongs to the ad account and does
+                                # not come back within the run. Walking on to the next
+                                # window only collects more refusals -- fourteen of
+                                # them on facebook-ads-69sh, the first backfill of a
+                                # source starting in 2025 -- and if the quota does
+                                # free up mid-run, a later window builds while the
+                                # skipped ones stay behind the bookmark and become a
+                                # hole no lookback reaches. Stop the stream here: the
+                                # next run picks up where the data stopped.
+                                internal_logger.warning(
+                                    f"[{self.name}] Account budget spent at {report_date}; ending the stream here "
+                                    f"instead of asking for the remaining windows. The {records_emitted} record(s) "
+                                    "already extracted are kept and the next run resumes from them."
+                                )
+                                self._note_budget_spent_at(report_date)
+                                stop_stream = True
+                                break
+                        # Nothing queued: skip the whole span this batch just tried,
+                        # not a single date -- otherwise every date is re-requested
+                        # up to batch_size times before the window moves past it.
+                        attempted = self._span_slices if self._span_mode else batch_size
+                        report_date = self._advance_batch(report_date, time_increment, attempted, range_end)
+                        continue
+
+                    # Process all reports in the batch
+                    for record in self._process_report_batch(batch_reports, columns, time_increment):
+                        records_emitted += 1
+                        yield record
+
+                    if AdsInsightStream._account_not_building:
+                        # Nothing this run can do for the rest of the period; the
+                        # floor below decides whether it ends red.
+                        stop_stream = True
+                        break
+
+                    if self._rejected_columns:
+                        # A column was refused while reading results: resume from the
+                        # date that failed, so dates already yielded in this batch are
+                        # not emitted twice.
+                        columns, report_date = self._resume_after_rejection(columns, report_date)
+                        continue
+
+                    if self._split_from is not None:
+                        # The period is now asked for in parts. Nothing was emitted
+                        # for the date that failed, so pick the window back up there
+                        # (dates before it in the batch were already yielded).
+                        report_date = self._split_from
+                        self._split_from = None
+                        continue
+
+                    if self._throttled_from is not None:
+                        # Processing ran into the ad account's limit. Nothing was
+                        # emitted for that date, so the window can be asked for again
+                        # -- but as one report, the single call the account can still
+                        # afford. When that is already the shape being used, there is
+                        # nothing left to shrink, so the window is skipped instead of
+                        # retried forever.
+                        resume_from = self._throttled_from
+                        self._throttled_from = None
+                        # Reports had been queued for this window, so without this
+                        # the floor would read "queued, nothing failed, no rows" as an
+                        # account with nothing to report and end the run green
+                        # (TJaE, 17/09/2026).
                         self._dates_failed += 1
                         self._warn_throttle_is_unrecoverable()
                         if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
-                            # The spent budget belongs to the ad account and does
-                            # not come back within the run. Walking on to the next
-                            # window only collects more refusals -- fourteen of
-                            # them on facebook-ads-69sh, the first backfill of a
-                            # source starting in 2025 -- and if the quota does
-                            # free up mid-run, a later window builds while the
-                            # skipped ones stay behind the bookmark and become a
-                            # hole no lookback reaches. Stop the stream here: the
-                            # next run picks up where the data stopped.
+                            # Same reason as a window that could not be queued at
+                            # all: skipping to the next window leaves this one
+                            # behind the bookmark as a hole if the quota frees up and
+                            # a later window builds. Nine skips on v1.80/1.81 in the
+                            # week to 24/09/2026, none followed by a build -- yet.
                             internal_logger.warning(
-                                f"[{self.name}] Account budget spent at {report_date}; ending the stream here "
-                                f"instead of asking for the remaining windows. The {records_emitted} record(s) "
+                                f"[{self.name}] Account budget spent at {resume_from} while retrying; ending the "
+                                f"stream here instead of skipping the window. The {records_emitted} record(s) "
                                 "already extracted are kept and the next run resumes from them."
                             )
+                            self._note_budget_spent_at(resume_from)
+                            stop_stream = True
                             break
-                    # Nothing queued: skip the whole span this batch just tried,
-                    # not a single date -- otherwise every date is re-requested
-                    # up to batch_size times before the window moves past it.
-                    attempted = self._span_slices if self._span_mode else batch_size
-                    report_date = self._advance_batch(report_date, time_increment, attempted, sync_end_date)
-                    continue
+                        attempted = self._span_slices if self._span_mode else batch_size
+                        report_date = self._advance_batch(resume_from, time_increment, attempted, range_end)
+                        continue
 
-                # Process all reports in the batch
-                for record in self._process_report_batch(batch_reports, columns, time_increment):
-                    records_emitted += 1
-                    yield record
+                    if self._span_resize_from is not None:
+                        # Facebook said the window was too large. Nothing was
+                        # emitted for it, so the same dates are asked for again in
+                        # the narrower windows _shrink_span_after_too_large chose.
+                        report_date = self._span_resize_from
+                        self._span_resize_from = None
+                        continue
 
-                if AdsInsightStream._account_not_building:
-                    # Nothing this run can do for the rest of the period; the
-                    # floor below decides whether it ends red.
-                    break
+                    if self._span_failed_from is not None:
+                        # The degraded report could not be built. Pick the same range
+                        # back up one slice at a time; it yielded nothing, so nothing
+                        # is emitted twice.
+                        report_date = self._span_failed_from
+                        self._span_failed_from = None
+                        continue
 
-                if self._rejected_columns:
-                    # A column was refused while reading results: resume from the
-                    # date that failed, so dates already yielded in this batch are
-                    # not emitted twice.
-                    columns, report_date = self._resume_after_rejection(columns, report_date)
-                    continue
+                    # Successfully processed batch, advance to next batch
+                    report_date = batch_reports[-1]["next_date"]
+                    retry_count = 0  # Reset retry count on success
 
-                if self._split_from is not None:
-                    # The period is now asked for in parts. Nothing was emitted
-                    # for the date that failed, so pick the window back up there
-                    # (dates before it in the batch were already yielded).
-                    report_date = self._split_from
-                    self._split_from = None
-                    continue
+                    # Brief pause between batches to avoid overwhelming API
+                    time.sleep(AD_REPORT_INCREMENT_SLEEP_TIME)
 
-                if self._throttled_from is not None:
-                    # Processing ran into the ad account's limit. Nothing was
-                    # emitted for that date, so the window can be asked for again
-                    # -- but as one report, the single call the account can still
-                    # afford. When that is already the shape being used, there is
-                    # nothing left to shrink, so the window is skipped instead of
-                    # retried forever.
-                    resume_from = self._throttled_from
-                    self._throttled_from = None
-                    # Reports had been queued for this window, so without this
-                    # the floor would read "queued, nothing failed, no rows" as an
-                    # account with nothing to report and end the run green
-                    # (TJaE, 17/09/2026).
-                    self._dates_failed += 1
-                    self._warn_throttle_is_unrecoverable()
-                    if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
-                        # Same reason as a window that could not be queued at
-                        # all: skipping to the next window leaves this one
-                        # behind the bookmark as a hole if the quota frees up and
-                        # a later window builds. Nine skips on v1.80/1.81 in the
-                        # week to 24/09/2026, none followed by a build -- yet.
-                        internal_logger.warning(
-                            f"[{self.name}] Account budget spent at {resume_from} while retrying; ending the "
-                            f"stream here instead of skipping the window. The {records_emitted} record(s) "
-                            "already extracted are kept and the next run resumes from them."
-                        )
-                        break
-                    attempted = self._span_slices if self._span_mode else batch_size
-                    report_date = self._advance_batch(resume_from, time_increment, attempted, sync_end_date)
-                    continue
+                except FacebookRequestError as fb_err:
+                    # Handle specific insights API errors first
+                    if fb_err.http_status() == HTTPStatus.BAD_REQUEST and "unsupported get request" in str(
+                        fb_err.api_error_message().lower()
+                    ):
+                        user_logger.warning(f"[{self.name}] API Error: {fb_err.api_error_message()}. Trying again..")
+                        retry_count += 1
+                        continue
 
-                if self._span_resize_from is not None:
-                    # Facebook said the window was too large. Nothing was
-                    # emitted for it, so the same dates are asked for again in
-                    # the narrower windows _shrink_span_after_too_large chose.
-                    report_date = self._span_resize_from
-                    self._span_resize_from = None
-                    continue
+                    # Use base class error handling for common errors (rate limits, server errors)
+                    if self._handle_facebook_request_error(fb_err, retry_count, 10):
+                        retry_count += 1
+                        continue
 
-                if self._span_failed_from is not None:
-                    # The degraded report could not be built. Pick the same range
-                    # back up one slice at a time; it yielded nothing, so nothing
-                    # is emitted twice.
-                    report_date = self._span_failed_from
-                    self._span_failed_from = None
-                    continue
+                    user_logger.error(f"[{self.name}] An unhandled error occurred: {fb_err}. Stopping execution.")
+                    user_logger.exception(f"[{self.name}] An unhandled error occurred: {fb_err}. Stopping execution.")
+                    sys.exit(1)
 
-                # Successfully processed batch, advance to next batch
-                report_date = batch_reports[-1]["next_date"]
-                retry_count = 0  # Reset retry count on success
-
-                # Brief pause between batches to avoid overwhelming API
-                time.sleep(AD_REPORT_INCREMENT_SLEEP_TIME)
-
-            except FacebookRequestError as fb_err:
-                # Handle specific insights API errors first
-                if fb_err.http_status() == HTTPStatus.BAD_REQUEST and "unsupported get request" in str(
-                    fb_err.api_error_message().lower()
-                ):
-                    user_logger.warning(f"[{self.name}] API Error: {fb_err.api_error_message()}. Trying again..")
-                    retry_count += 1
-                    continue
-
-                # Use base class error handling for common errors (rate limits, server errors)
-                if self._handle_facebook_request_error(fb_err, retry_count, 10):
-                    retry_count += 1
-                    continue
-
-                user_logger.error(f"[{self.name}] An unhandled error occurred: {fb_err}. Stopping execution.")
-                user_logger.exception(f"[{self.name}] An unhandled error occurred: {fb_err}. Stopping execution.")
-                sys.exit(1)
+            if rereading:
+                # Days of the re-read were loaded by an earlier run: one that
+                # failed now is not a missing date (see _report_unfinished_reread).
+                self._reread_failed = self._dates_failed - failed_before_range
+                self._dates_failed = failed_before_range
+            if stop_stream:
+                break
+        self._rereading = False
 
         self._fail_if_nothing_extracted(batches_attempted, reports_queued, records_emitted)
 

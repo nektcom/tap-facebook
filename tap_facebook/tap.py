@@ -34,6 +34,7 @@ from tap_facebook.streams import (
     CustomAudiences,
     CustomConversions,
 )
+from tap_facebook.streams.ad_insights import LAST_SERVED_STATE_KEY
 from tap_facebook.streams.creative import creative_files_enabled
 
 
@@ -544,6 +545,7 @@ class TapFacebook(Tap):
                 else "incremental -- a short insights stream only warns."
             )
         )
+        self._serve_the_longest_waiting_insights_stream_first()
         super().sync_all(*args, **kwargs)
         incomplete = list(AdsInsightStream._incomplete_without_history)
         if not incomplete:
@@ -558,6 +560,38 @@ class TapFacebook(Tap):
             "on a table the destination replaces (full sync, first run or FULL_TABLE); their bookmarks were finalized."
         )
         sys.exit(1)
+
+    def _serve_the_longest_waiting_insights_stream_first(self) -> None:
+        """Order the insights streams by when each last got a report, oldest first.
+
+        The ad account's budget is spent in stream order, so the stream at the
+        front of the queue is the one sure to advance. The hourly rotation of
+        `load_streams` alone did not see who had been waiting: on
+        facebook-ads-WhFu (seven insights streams) `adsinsights` got 0-1 report
+        per run for days from 2026-09-30 while the breakdowns ahead of it stayed
+        current. A stream records when it was served in its own state
+        (LAST_SERVED_STATE_KEY); one that never was goes first. The rotation
+        still breaks ties, so a first run is ordered as before.
+        """
+        streams = list(self.streams.items())
+        insights = [(name, stream) for name, stream in streams if isinstance(stream, AdsInsightStream)]
+        if len(insights) < 2:  # noqa: PLR2004
+            return
+        bookmarks = (self.state or {}).get("bookmarks") or {}
+
+        def last_served(item: tuple[str, FacebookStream]) -> str:
+            stream_state = bookmarks.get(item[1].name)
+            if not isinstance(stream_state, dict):
+                return ""
+            return str(stream_state.get(LAST_SERVED_STATE_KEY) or "")
+
+        ordered = sorted(insights, key=last_served)  # stable: the rotation breaks ties
+        others = [(name, stream) for name, stream in streams if not isinstance(stream, AdsInsightStream)]
+        self._streams = dict([*others, *ordered])
+        internal_logger.info(
+            "Insights served in this order (longest wait first): "
+            + ", ".join(f"{stream.name} ({last_served((name, stream)) or 'never'})" for name, stream in ordered)
+        )
 
     def load_streams(self) -> list[FacebookStream]:
         """Order the streams for the sync.
