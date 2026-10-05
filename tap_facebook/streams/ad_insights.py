@@ -543,6 +543,18 @@ SPAN_WIDTH_TTL_DAYS = 7
 # the breakdowns before it stayed current.
 LAST_SERVED_STATE_KEY = "insights_last_served"
 
+# Periods a run could not extract while it went on to later dates -- a report
+# Facebook failed to build, a window it built only in part -- kept in the state
+# and asked for first by the next runs. Until v1.86 the lookback re-read is what
+# picked them up, by re-reading the days before the bookmark; it now covers only
+# the last days before today (see _lookback_start), so a period that failed
+# while a stream was catching up would otherwise stay missing behind the
+# bookmark. Each retry is one report; a period still failing after
+# MISSING_PERIOD_ATTEMPTS runs is dropped and named to the customer.
+MISSING_PERIODS_STATE_KEY = "insights_missing_periods"
+MISSING_PERIOD_ATTEMPTS = 3
+MISSING_PERIODS_KEPT = 20
+
 # A span job that Facebook fails to build is recreated this many times before
 # the shape is given up on. Most job failures are transient (~14% of jobs die
 # at 0% and succeed on the next attempt), and the arithmetic favours insisting:
@@ -798,6 +810,13 @@ class AdsInsightStream(FacebookSDKStream):
         self._rereading = False
         self._reread_failed = 0
         self._reread_stopped_at: pendulum.Date | None = None
+        # Periods left behind (see MISSING_PERIODS_STATE_KEY): the ones handed
+        # in, updated by this run's retries, and the ones this run left.
+        self._missing_periods: list[dict] = []
+        self._missing_found: list[tuple[pendulum.Date, pendulum.Date]] = []
+        self._tracking_missing = False
+        self._window_from: pendulum.Date | None = None
+        self._failed_before_window = 0
         self._served = False
 
     def _note_throttled(self, fb_err: FacebookRequestError, current_date: pendulum.Date) -> None:
@@ -1192,12 +1211,7 @@ class AdsInsightStream(FacebookSDKStream):
             value = self.get_context_state(self._sync_context).get("replication_key_value")
         except Exception:  # noqa: BLE001 -- no readable state is no bookmark
             return None
-        if value in (None, ""):
-            return None
-        try:
-            return pendulum.parse(str(value)).date()
-        except Exception:  # noqa: BLE001 -- an unreadable bookmark is not a floor
-            return None
+        return self._as_date(value)
 
     def _finalize_state(self, state: dict | None = None) -> None:
         """Promote this run's bookmark, but never below the one the run was handed.
@@ -1208,26 +1222,131 @@ class AdsInsightStream(FacebookSDKStream):
         earlier still: adsinsights on facebook-ads-WhFu went 30/09 -> 26/09 ->
         22/09 -> 18/09 -> 14/09 -> 10/09 in five green runs (2026-09-30 to
         10-02) without loading a single new date. Every day up to the bookmark
-        the run was handed had been loaded by an earlier run, so keeping that
+        the run was handed had been loaded by an earlier run, or is kept in
+        MISSING_PERIODS_STATE_KEY to be asked for again, so keeping that
         bookmark loses nothing.
         """
         super()._finalize_state(state)
+        if not state:
+            return
+        finalized = self._as_date(state.get("replication_key_value"))
         floor = getattr(self, "_bookmark_handed_in", None)
-        if floor is None or not state:
-            return
-        value = state.get("replication_key_value")
+        if floor is not None and finalized is not None and finalized < floor:
+            state["replication_key_value"] = floor.to_date_string()
+            internal_logger.info(
+                f"[{self.name}] Bookmark kept at {floor.to_date_string()}: the latest date this run extracted was "
+                f"{finalized.to_date_string()}, before the bookmark it was handed."
+            )
+            finalized = floor
+        self._save_missing_periods(state, finalized)
+
+    @staticmethod
+    def _as_date(value: object) -> pendulum.Date | None:
+        """A state value as a date, or None when there is none or it cannot be read."""
         if value in (None, ""):
-            return
+            return None
         try:
-            finalized = pendulum.parse(str(value)).date()
+            return pendulum.parse(str(value)).date()
         except Exception:  # noqa: BLE001 -- leave a value we cannot read to the SDK
+            return None
+
+    @staticmethod
+    def _period_label(start: pendulum.Date, until: pendulum.Date) -> str:
+        if start == until:
+            return start.to_date_string()
+        return f"{start.to_date_string()} to {until.to_date_string()}"
+
+    def _read_missing_periods(self, context: dict | None) -> list[dict]:
+        """The periods earlier runs left behind, oldest first (see MISSING_PERIODS_STATE_KEY)."""
+        try:
+            stored = self.get_context_state(context).get(MISSING_PERIODS_STATE_KEY) or []
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not read the missing periods from the state.", exc_info=True)
+            return []
+        oldest_kept = pendulum.today().date().subtract(months=37)
+        periods = []
+        for item in stored if isinstance(stored, list) else []:
+            try:
+                start = pendulum.parse(str(item["from"])).date()
+                until = pendulum.parse(str(item["until"])).date()
+                attempts = int(item.get("attempts", 0))
+            except Exception:  # noqa: BLE001 -- an unreadable entry is dropped, not trusted
+                internal_logger.warning(f"[{self.name}] Dropped an unreadable missing period: {item!r}")
+                continue
+            if until < oldest_kept:
+                user_logger.warning(
+                    f"[{self.name}] {self._period_label(start, until)}, which an earlier run could not extract, is "
+                    "now older than the 37 months Facebook keeps and can no longer be extracted."
+                )
+                continue
+            periods.append({"from": max(start, oldest_kept), "until": until, "attempts": attempts})
+        return sorted(periods, key=lambda period: period["from"])
+
+    def _save_missing_periods(self, state: dict, bookmark: pendulum.Date | None) -> None:
+        """Keep the periods still missing behind the bookmark for the next runs.
+
+        A period this run left at or after the bookmark is not kept: the next
+        run's new dates start at the bookmark and cover it.
+        """
+        if not getattr(self, "_tracking_missing", False):
             return
-        if finalized >= floor:
+        periods = [dict(period) for period in self._missing_periods]
+        for start, until in self._missing_found:
+            if bookmark is None or start >= bookmark:
+                continue
+            periods.append({"from": start, "until": min(until, bookmark.subtract(days=1)), "attempts": 0})
+        if len(periods) > MISSING_PERIODS_KEPT:
+            dropped = periods[:-MISSING_PERIODS_KEPT]
+            periods = periods[-MISSING_PERIODS_KEPT:]
+            user_logger.warning(
+                f"[{self.name}] More than {MISSING_PERIODS_KEPT} periods could not be extracted; these are no longer "
+                "requested automatically and stay missing from the table: "
+                f"{', '.join(self._period_label(p['from'], p['until']) for p in dropped)}."
+            )
+        if not periods:
+            state.pop(MISSING_PERIODS_STATE_KEY, None)
             return
-        state["replication_key_value"] = floor.to_date_string()
-        internal_logger.info(
-            f"[{self.name}] Bookmark kept at {floor.to_date_string()}: the latest date this run extracted was "
-            f"{finalized.to_date_string()}, before the bookmark it was handed."
+        state[MISSING_PERIODS_STATE_KEY] = [
+            {"from": p["from"].to_date_string(), "until": p["until"].to_date_string(), "attempts": p["attempts"]}
+            for p in periods
+        ]
+
+    def _step_window(self, report_date: pendulum.Date) -> None:
+        """Note the window just left as missing when one of its dates failed.
+
+        Called as the extraction of the new dates moves on: a failure in a
+        window that the run then walks past leaves a gap behind the bookmark
+        the run finalizes. The same window asked for again in another shape
+        (a narrower report, split parts) is still the same window.
+        """
+        if not self._tracking_missing:
+            return
+        if self._window_from is not None:
+            if report_date <= self._window_from:
+                return
+            if self._dates_failed > self._failed_before_window:
+                self._missing_found.append((self._window_from, report_date.subtract(days=1)))
+        self._window_from = report_date
+        self._failed_before_window = self._dates_failed
+
+    def _settle_missing_period(self, period: dict, *, failed: bool, stopped: bool) -> None:
+        """Record the outcome of asking again for a period an earlier run left behind."""
+        label = self._period_label(period["from"], period["until"])
+        if stopped:
+            # The account's budget ran out, or Facebook stopped building for the
+            # account: that says nothing about this period, so it is no attempt.
+            return
+        if not failed:
+            self._missing_periods.remove(period)
+            user_logger.info(f"[{self.name}] {label}, which an earlier run could not extract, is now extracted.")
+            return
+        period["attempts"] += 1
+        if period["attempts"] < MISSING_PERIOD_ATTEMPTS:
+            return
+        self._missing_periods.remove(period)
+        user_logger.warning(
+            f"[{self.name}] Facebook did not build the report for {label} in {MISSING_PERIOD_ATTEMPTS} runs. "
+            "Those dates are no longer requested automatically and stay missing from the table."
         )
 
     def _lookback_only_near_today(self) -> bool:
@@ -3259,18 +3378,35 @@ class AdsInsightStream(FacebookSDKStream):
         # replaced every run.
         if self.replication_method != REPLICATION_FULL_TABLE:
             self._bookmark_handed_in = self._read_bookmark()
+            self._tracking_missing = self._lookback_only_near_today()
+        if self._tracking_missing:
+            self._missing_periods = self._read_missing_periods(context)
+        if self._missing_periods:
+            user_logger.info(
+                f"[{self.name}] Asking first for {len(self._missing_periods)} period(s) that an earlier run could "
+                "not extract: "
+                f"{', '.join(self._period_label(p['from'], p['until']) for p in self._missing_periods)}."
+            )
         stop_stream = False
 
-        for range_start, range_end, rereading in self._extraction_ranges(report_date, sync_end_date):
+        ranges = [(period["from"], period["until"], False, period) for period in self._missing_periods] + [
+            (start, until, rereading, None)
+            for start, until, rereading in self._extraction_ranges(report_date, sync_end_date)
+        ]
+        for range_start, range_end, rereading, missing_period in ranges:
             self._rereading = rereading
             failed_before_range = self._dates_failed
+            new_dates = not rereading and missing_period is None
             if rereading:
                 internal_logger.info(
                     f"[{self.name}] New dates done; re-reading {range_start} to {range_end} (lookback)."
                 )
             report_date = range_start
+            self._window_from = None
             # Use batch processing for parallel report creation
             while report_date <= range_end:
+                if new_dates:
+                    self._step_window(report_date)
                 if retry_count > 10:
                     user_logger.error(f"[{self.name}] Failed to get insights after 10 retries. Stopping execution.")
                     sys.exit(1)
@@ -3431,6 +3567,12 @@ class AdsInsightStream(FacebookSDKStream):
                     user_logger.exception(f"[{self.name}] An unhandled error occurred: {fb_err}. Stopping execution.")
                     sys.exit(1)
 
+            if new_dates and not stop_stream:
+                self._step_window(report_date)
+            if missing_period is not None:
+                self._settle_missing_period(
+                    missing_period, failed=self._dates_failed > failed_before_range, stopped=stop_stream
+                )
             if rereading:
                 # Days of the re-read were loaded by an earlier run: one that
                 # failed now is not a missing date (see _report_unfinished_reread).
