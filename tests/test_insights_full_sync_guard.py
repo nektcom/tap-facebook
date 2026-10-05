@@ -27,8 +27,8 @@ import pytest
 
 from tap_facebook.streams.ad_insights import (
     SPAN_MAX_SLICES,
+    SPAN_WIDEN_RETRY_DAYS,
     SPAN_WIDTH_STATE_KEY,
-    SPAN_WIDTH_TTL_DAYS,
     AdsInsightStream,
 )
 from tap_facebook.tap import TapFacebook
@@ -267,10 +267,21 @@ class TestTheWidthIsReadBackByTheNextRun:
 
         assert stream._span_slices == 5
 
-    def test_an_expired_width_gives_the_full_window_back(self):
+    def test_an_old_width_is_kept_and_climbs_from_there(self):
+        """Until v1.87 it expired after seven days and the next run asked for 31 again."""
         stream = make_stream()
-        old = pendulum.today().subtract(days=SPAN_WIDTH_TTL_DAYS + 1).to_date_string()
+        old = pendulum.today().subtract(days=SPAN_WIDEN_RETRY_DAYS + 1).to_date_string()
         stream.stream_state[SPAN_WIDTH_STATE_KEY] = {"slices": 5, "since": old}
+
+        stream._restore_span_width(None)
+
+        assert stream._span_slices == 5
+        assert stream._may_widen is True
+        assert stream.stream_state[SPAN_WIDTH_STATE_KEY] == {"slices": 5, "since": old}
+
+    def test_the_full_width_needs_no_marker(self):
+        stream = make_stream()
+        stream.stream_state[SPAN_WIDTH_STATE_KEY] = {"slices": SPAN_MAX_SLICES, "since": "2026-09-24"}
 
         stream._restore_span_width(None)
 

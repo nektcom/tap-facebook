@@ -30,8 +30,9 @@ from tap_facebook.streams.ad_insights import (
     LAST_SERVED_STATE_KEY,
     MISSING_PERIOD_ATTEMPTS,
     MISSING_PERIODS_STATE_KEY,
+    SPAN_MAX_SLICES,
+    SPAN_WIDEN_RETRY_DAYS,
     SPAN_WIDTH_STATE_KEY,
-    SPAN_WIDTH_TTL_DAYS,
     AdsInsightStream,
 )
 from tap_facebook.tap import TapFacebook
@@ -332,7 +333,20 @@ class TestTheCustomerIsToldWhatTheTapDecided:
         said = user.info.call_args.args[0]
         assert "reports of 3 day(s) each" in said
         assert f"on {since}" in said
-        assert f"from {since.add(days=SPAN_WIDTH_TTL_DAYS + 1)}" in said
+        assert "first tries a report of up to 7 day(s) when it has more than 3 day(s) to extract" in said
+
+    def test_the_wait_after_a_failed_widening_is_shown(self):
+        failed_on = TODAY.subtract(days=2)
+        stream = stream_with_bookmark(TODAY.subtract(days=1))
+        stream.get_context_state(None)[SPAN_WIDTH_STATE_KEY] = {
+            "slices": 3,
+            "since": TODAY.subtract(days=5).to_date_string(),
+            "wider_failed_on": failed_on.to_date_string(),
+        }
+        with mock.patch(USER) as user:
+            stream._restore_span_width(None)
+        said = user.info.call_args.args[0]
+        assert f"A larger report is tried again from {failed_on.add(days=SPAN_WIDEN_RETRY_DAYS)}" in said
 
     def test_a_partial_update_names_where_the_budget_ran_out(self):
         stream = stream_with_bookmark(TODAY.subtract(days=10))
@@ -487,3 +501,121 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         self.run(stream, lambda start, end: "failed" if start == BEHIND.start_of("month") else "ok")
         assert stream._tracking_missing is False
         assert stream._missing_found == []
+
+
+class TestTheWindowClimbsBackOneStepAtATime:
+    """3 -> 7 -> 15 -> 31, one step per run, never a whole ladder at once."""
+
+    def stream(self, slices: int | None, failed_on: pendulum.Date | None = None) -> AdsInsightStream:
+        stream = stream_with_bookmark(BEHIND)
+        if slices is not None:
+            marker = {"slices": slices, "since": TODAY.subtract(days=1).to_date_string()}
+            if failed_on is not None:
+                marker["wider_failed_on"] = failed_on.to_date_string()
+            stream.get_context_state(None)[SPAN_WIDTH_STATE_KEY] = marker
+        with mock.patch(USER):
+            stream._restore_span_width(None)
+        return stream
+
+    def run(self, stream, too_large_at: set[int] = frozenset()):
+        """get_records over a long backfill; windows as wide as `_span_slices`."""
+        widths = []
+
+        def created(*, start_date, end_date, **kwargs):
+            widths.append(stream._span_slices)
+            until = min(start_date.add(days=stream._span_slices - 1), end_date)
+            return [{"next_date": until.add(days=1), "date_obj": start_date, "until_obj": until, "date": "w"}]
+
+        def processed(reports, *args, **kwargs):
+            report = reports[0]
+            if stream._span_slices in too_large_at:
+                stream._shrink_span_after_too_large(report["date_obj"], report["until_obj"], "w", 1)
+                return iter([])
+            return iter([{"id": "1"}])
+
+        with (
+            mock.patch.object(stream, "_initialize_client"),
+            mock.patch.object(stream, "_create_report_batch", side_effect=created),
+            mock.patch.object(stream, "_process_report_batch", side_effect=processed),
+            mock.patch("tap_facebook.streams.ad_insights.time.sleep"),
+            mock.patch(USER) as user,
+        ):
+            list(stream.get_records(None))
+        return widths, user
+
+    def marker(self, stream) -> dict | None:
+        return stream.get_context_state(None).get(SPAN_WIDTH_STATE_KEY)
+
+    def test_a_run_with_several_windows_tries_one_step_wider_and_keeps_it(self):
+        stream = self.stream(3)
+        widths, user = self.run(stream)
+        assert widths[:3] == [7, 7, 7]
+        assert self.marker(stream) == {"slices": 7, "since": TODAY.to_date_string()}
+        infos = [call.args[0] for call in user.info.call_args_list]
+        assert any("Trying a report of 7 day(s) (up from 3)" in text for text in infos)
+        assert any("built the report of 7 day(s)" in text and "next run tries 15" in text for text in infos)
+
+    def test_a_wider_window_too_large_goes_back_to_what_builds_and_waits(self):
+        since = TODAY.subtract(days=1).to_date_string()
+        stream = self.stream(3)
+        widths, user = self.run(stream, too_large_at={7})
+        assert widths[:3] == [7, 3, 3]
+        assert self.marker(stream) == {"slices": 3, "since": since, "wider_failed_on": TODAY.to_date_string()}
+        infos = [call.args[0] for call in user.info.call_args_list]
+        assert any(
+            "report of 7 day(s) for w was too large" in text
+            and f"tried again from {TODAY.add(days=SPAN_WIDEN_RETRY_DAYS)}" in text
+            for text in infos
+        )
+
+    def test_no_attempt_during_the_wait(self):
+        stream = self.stream(3, failed_on=TODAY.subtract(days=SPAN_WIDEN_RETRY_DAYS - 1))
+        widths, _ = self.run(stream)
+        assert set(widths) == {3}
+
+    def test_the_attempt_comes_back_after_the_wait(self):
+        stream = self.stream(3, failed_on=TODAY.subtract(days=SPAN_WIDEN_RETRY_DAYS))
+        widths, _ = self.run(stream)
+        assert widths[0] == 7
+
+    def test_reaching_the_full_window_drops_the_marker(self):
+        stream = self.stream(15)
+        widths, _ = self.run(stream)
+        assert widths[0] == SPAN_MAX_SLICES
+        assert self.marker(stream) is None
+
+    def test_one_window_to_extract_is_no_reason_to_try(self):
+        """An up-to-date stream would save nothing and risk a creation."""
+        stream = self.stream(7)
+        stream._try_wider(TODAY.subtract(days=6), TODAY, 1)
+        assert stream._span_slices == 7
+        assert stream._widening_to is None
+        assert stream._may_widen is False
+
+    def test_the_attempt_is_no_wider_than_what_there_is_to_extract(self):
+        stream = self.stream(7)
+        stream._try_wider(TODAY.subtract(days=9), TODAY, 1)
+        assert stream._span_slices == 10
+        assert stream._widening_to == 10
+
+    def test_a_cut_waits_for_the_next_run(self):
+        """The cut itself was the failed attempt at the wider width."""
+        stream = self.stream(15)
+        with mock.patch(USER):
+            stream._shrink_span_after_too_large(BEHIND, BEHIND.add(days=14), "w", 1)
+        assert stream._span_slices == 7
+        assert stream._may_widen is False
+        assert self.marker(stream) == {"slices": 7, "since": TODAY.to_date_string()}
+
+    def test_the_run_after_a_cut_tries_one_step_up(self):
+        stream = stream_with_bookmark(BEHIND)
+        stream.get_context_state(None)[SPAN_WIDTH_STATE_KEY] = {"slices": 7, "since": TODAY.to_date_string()}
+        with mock.patch(USER):
+            stream._restore_span_width(None)
+        assert stream._may_widen is True
+
+    def test_without_a_remembered_width_nothing_changes(self):
+        stream = self.stream(None)
+        widths, _ = self.run(stream)
+        assert set(widths) == {SPAN_MAX_SLICES}
+        assert self.marker(stream) is None

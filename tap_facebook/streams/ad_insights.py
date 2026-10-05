@@ -530,10 +530,20 @@ REPORT_TOO_LARGE_SUBCODES = frozenset({1504045})
 
 # The window width (in slices) that the account last built, kept in the state so
 # the next runs start there instead of rediscovering it at the cost of a
-# creation per attempt. It expires so a quieter account gets the wide window
-# back; one failed attempt at the full width is all that costs.
+# creation per attempt.
+#
+# The width climbs back one step per run (3 -> 7 -> 15 -> 31, the halving
+# ladder in reverse): a run with more than one window to extract asks for its
+# first window one step wider. If Facebook builds it, the run goes on at that
+# width and the next run tries the step above; if it is too large, the same
+# dates are asked for at the width that builds, and no wider window is tried
+# for SPAN_WIDEN_RETRY_DAYS. Until v1.87 the width was kept for seven days and
+# then reset to the full 31: an account still unable to build that paid the
+# whole ladder again (31, 15, then 7: two creations thrown away), and an
+# account that could build wider again waited the seven days at 3
+# (facebook-ads-egWh, 2026-10-01 to 10-05, catching up on 2024).
 SPAN_WIDTH_STATE_KEY = "insights_span_width"
-SPAN_WIDTH_TTL_DAYS = 7
+SPAN_WIDEN_RETRY_DAYS = 7
 
 # When each insights stream was last given a report, as an ISO timestamp in its
 # own state. TapFacebook.sync_all serves the stream that waited longest first:
@@ -783,6 +793,12 @@ class AdsInsightStream(FacebookSDKStream):
         # back from the state by _restore_span_width.
         self._span_slices = SPAN_MAX_SLICES
         self._span_resize_from: pendulum.Date | None = None
+        # Climbing back (see SPAN_WIDTH_STATE_KEY): whether this run may try one
+        # step wider, the width being tried, and what the state said.
+        self._may_widen = False
+        self._widening_to: int | None = None
+        self._width_before_widening: int | None = None
+        self._width_since: pendulum.Date | None = None
         # Set by _record_job_failure for the attempt in progress, and for the
         # whole run so the floor can name the cause to the customer.
         self._job_too_large = False
@@ -1075,13 +1091,17 @@ class AdsInsightStream(FacebookSDKStream):
         Returns False when the window is already a single slice: then there is
         nothing left to cut by days and the usual ladder (retry, probe, split by
         columns) takes over. The narrower width is kept in the state for the
-        next runs (SPAN_WIDTH_TTL_DAYS).
+        next runs, which climb back one step at a time (SPAN_WIDTH_STATE_KEY).
         """
+        if self._widening_to is not None:
+            return self._widening_failed(date_obj, report_date, time_increment)
         slices = self._slices_between(date_obj, span_until, time_increment)
         if slices <= 1:
             return False
         narrower = max(1, slices // 2)
         self._span_slices = narrower
+        # The climb back starts with the next run, not later in this one.
+        self._may_widen = False
         self._span_resize_from = date_obj
         try:
             state = self.get_context_state(self._sync_context)
@@ -1097,13 +1117,105 @@ class AdsInsightStream(FacebookSDKStream):
         internal_logger.info(
             f"[{self.name}] act_{self.config.get('account_id')}: span {report_date} ({slices} slices) failed on "
             f"size (subcode in {sorted(REPORT_TOO_LARGE_SUBCODES)}); width {slices} -> {narrower}, resuming from "
-            f"{date_obj.to_date_string()}, remembered for {SPAN_WIDTH_TTL_DAYS} days. Last job error: "
+            f"{date_obj.to_date_string()}; the next run may try {self._wider(narrower)}. Last job error: "
+            f"{self._last_job_error!r}"
+        )
+        return True
+
+    @staticmethod
+    def _wider(slices: int) -> int:
+        """One step up the halving ladder (3 -> 7 -> 15 -> 31)."""
+        return min(SPAN_MAX_SLICES, slices * 2 + 1)
+
+    def _unit(self, time_increment: int | str | None = None) -> str:
+        increment = self._effective_time_increment if time_increment is None else time_increment
+        return "day(s)" if increment == 1 else "period(s)"
+
+    def _try_wider(self, start: pendulum.Date, until: pendulum.Date, time_increment: int | str) -> None:
+        """Ask for the first window of the new dates one step wider, once per run.
+
+        Only when the run has more than one window to extract at the current
+        width: a stream that is up to date needs a single window, and a wider
+        one would save nothing while risking a creation.
+        """
+        if not self._may_widen or not self._span_mode:
+            return
+        self._may_widen = False
+        to_extract = self._slices_between(start, until, time_increment)
+        if to_extract <= self._span_slices:
+            return
+        wider = min(self._wider(self._span_slices), to_extract)
+        self._width_before_widening = self._span_slices
+        self._widening_to = wider
+        self._span_slices = wider
+        unit = self._unit(time_increment)
+        user_logger.info(
+            f"[{self.name}] Trying a report of {wider} {unit} (up from {self._width_before_widening}). If "
+            f"Facebook refuses it as too large, the same dates are asked for in reports of "
+            f"{self._width_before_widening} {unit}; nothing is skipped."
+        )
+
+    def _confirm_wider(self, report: dict, time_increment: int | str) -> None:
+        """Keep the wider width once Facebook has built a window that wide."""
+        if self._widening_to is None or not self._span_mode:
+            return
+        until = report.get("until_obj")
+        start = report.get("date_obj")
+        if start is None or until is None:
+            return
+        built = self._slices_between(start, until, time_increment)
+        if built <= (self._width_before_widening or 0):
+            return
+        self._widening_to = None
+        self._span_slices = built
+        unit = self._unit(time_increment)
+        try:
+            state = self.get_context_state(self._sync_context)
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not record the span width in the state.", exc_info=True)
+        else:
+            if built >= SPAN_MAX_SLICES:
+                state.pop(SPAN_WIDTH_STATE_KEY, None)
+            else:
+                state[SPAN_WIDTH_STATE_KEY] = {"slices": built, "since": pendulum.today().to_date_string()}
+        user_logger.info(
+            f"[{self.name}] Facebook built the report of {built} {unit}; the rest of this run and the next runs "
+            f"ask for reports of {built} {unit}"
+            + (f", and the next run tries {self._wider(built)}." if built < SPAN_MAX_SLICES else ".")
+        )
+
+    def _widening_failed(self, date_obj: pendulum.Date, report_label: str, time_increment: int | str) -> bool:
+        """Go back to the width that builds after the wider window was too large."""
+        wider, width = self._widening_to, self._width_before_widening or 1
+        self._widening_to = None
+        self._span_slices = width
+        self._span_resize_from = date_obj
+        today = pendulum.today().date()
+        try:
+            state = self.get_context_state(self._sync_context)
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            internal_logger.warning(f"[{self.name}] Could not record the span width in the state.", exc_info=True)
+        else:
+            state[SPAN_WIDTH_STATE_KEY] = {
+                "slices": width,
+                "since": (self._width_since or today).to_date_string(),
+                "wider_failed_on": today.to_date_string(),
+            }
+        unit = self._unit(time_increment)
+        user_logger.info(
+            f"[{self.name}] The report of {wider} {unit} for {report_label} was too large for Facebook to build. "
+            f"Asking for the same dates in reports of {width} {unit}; nothing is skipped. A larger report is "
+            f"tried again from {today.add(days=SPAN_WIDEN_RETRY_DAYS).to_date_string()}."
+        )
+        internal_logger.info(
+            f"[{self.name}] act_{self.config.get('account_id')}: widening {width} -> {wider} failed on size at "
+            f"{report_label}; back to {width}, next attempt in {SPAN_WIDEN_RETRY_DAYS} days. Last job error: "
             f"{self._last_job_error!r}"
         )
         return True
 
     def _restore_span_width(self, context: dict | None) -> None:
-        """Start at the window width a recent run found this account can build."""
+        """Start at the window width an earlier run found this account can build."""
         try:
             state = self.get_context_state(context)
         except Exception:  # noqa: BLE001
@@ -1115,29 +1227,37 @@ class AdsInsightStream(FacebookSDKStream):
         try:
             slices = int(marker["slices"])
             since = pendulum.parse(str(marker["since"])).date()
+            failed_on = marker.get("wider_failed_on")
+            failed_on = pendulum.parse(str(failed_on)).date() if failed_on else None
         except Exception:  # noqa: BLE001 -- an unreadable marker is dropped, not trusted
             state.pop(SPAN_WIDTH_STATE_KEY, None)
             return
-        if since.add(days=SPAN_WIDTH_TTL_DAYS) < pendulum.today().date() or slices < 1:
+        if slices < 1 or slices >= SPAN_MAX_SLICES:
             state.pop(SPAN_WIDTH_STATE_KEY, None)
-            internal_logger.info(
-                f"[{self.name}] Span width marker ({slices} slices, {since.to_date_string()}) expired; "
-                f"trying the full {SPAN_MAX_SLICES}-slice window again."
-            )
             return
-        self._span_slices = min(slices, SPAN_MAX_SLICES)
+        self._span_slices = slices
+        self._width_since = since
+        retry_from = failed_on.add(days=SPAN_WIDEN_RETRY_DAYS) if failed_on is not None else None
+        self._may_widen = retry_from is None or retry_from <= pendulum.today().date()
         internal_logger.info(
             f"[{self.name}] Starting with {self._span_slices}-slice windows, as found on "
-            f"{since.to_date_string()} for this account (Facebook refused wider reports as too large)."
+            f"{since.to_date_string()} for this account (Facebook refused wider reports as too large); "
+            f"widening {'allowed' if self._may_widen else f'not before {retry_from}'}."
         )
         # Until v1.86 only the run that cut the window told the customer; the
         # runs after it went on with narrow windows and no word of why
         # (facebook-ads-egWh, 2026-10-01 to 10-05).
-        unit = "day(s)" if self._effective_time_increment == 1 else "period(s)"
+        unit = self._unit()
+        if self._may_widen:
+            next_step = (
+                f" This run first tries a report of up to {self._wider(slices)} {unit} when it has more than "
+                f"{slices} {unit} to extract."
+            )
+        else:
+            next_step = f" A larger report is tried again from {retry_from.to_date_string()}."
         user_logger.info(
             f"[{self.name}] Asking for reports of {self._span_slices} {unit} each: on {since.to_date_string()} "
-            "Facebook refused larger reports for this account as too large. The full window is tried again "
-            f"from {since.add(days=SPAN_WIDTH_TTL_DAYS + 1).to_date_string()}."
+            f"Facebook refused larger reports for this account as too large.{next_step}"
         )
 
     def _restore_split_mode(self, context: dict | None) -> None:
@@ -3403,6 +3523,8 @@ class AdsInsightStream(FacebookSDKStream):
                 )
             report_date = range_start
             self._window_from = None
+            if new_dates:
+                self._try_wider(range_start, range_end, time_increment)
             # Use batch processing for parallel report creation
             while report_date <= range_end:
                 if new_dates:
@@ -3543,6 +3665,7 @@ class AdsInsightStream(FacebookSDKStream):
                         continue
 
                     # Successfully processed batch, advance to next batch
+                    self._confirm_wider(batch_reports[-1], time_increment)
                     report_date = batch_reports[-1]["next_date"]
                     retry_count = 0  # Reset retry count on success
 
