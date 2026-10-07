@@ -750,6 +750,22 @@ class AdsInsightStream(FacebookSDKStream):
     # run once every stream is done; see TapFacebook.sync_all.
     _incomplete_without_history: list[str] = []  # noqa: RUF012
 
+    @property
+    def _dates_failed(self) -> int:
+        """Dates (or windows) of this run that could not be extracted."""
+        return self.__dict__.get("_dates_failed_count", 0)
+
+    @_dates_failed.setter
+    def _dates_failed(self, value: int) -> None:
+        # Each new failure keeps the latest date written so far: a failure is a
+        # gap behind the bookmark only if a later date was written after it
+        # (see _save_missing_periods). Lowering the count -- a re-read or a
+        # missing period reporting its own failures -- records nothing.
+        if value > self.__dict__.get("_dates_failed_count", 0):
+            snapshots = self.__dict__.setdefault("_failure_snapshots", [])
+            snapshots.extend([self.__dict__.get("_last_emitted")] * (value - self.__dict__.get("_dates_failed_count", 0)))
+        self.__dict__["_dates_failed_count"] = value
+
     # What each insights stream did not complete in this run, by stream and then
     # by kind (so finalizing a stream twice does not repeat a line), and whether
     # the ad account's report limit was among the causes. TapFacebook.sync_all
@@ -809,6 +825,7 @@ class AdsInsightStream(FacebookSDKStream):
         self._throttled = False
         self._throttle_wait = 0
         self._last_throttle_code: int | None = None
+        self._widening_just_failed = False
         # Facebook's own reason for the last job that ended as "Job Failed".
         self._last_job_error: dict = {}
         self._throttle_headers_logged = False
@@ -860,10 +877,12 @@ class AdsInsightStream(FacebookSDKStream):
         # Periods left behind (see MISSING_PERIODS_STATE_KEY): the ones handed
         # in, updated by this run's retries, and the ones this run left.
         self._missing_periods: list[dict] = []
-        self._missing_found: list[tuple[pendulum.Date, pendulum.Date]] = []
+        # (from, until, what had been written when each of its dates failed)
+        self._missing_found: list[tuple[pendulum.Date, pendulum.Date, list[str | None]]] = []
         self._tracking_missing = False
         self._window_from: pendulum.Date | None = None
-        self._failed_before_window = 0
+        self._failure_snapshots: list[str | None] = []
+        self._snapshots_before_window = 0
         # Where a retry of a missing period stopped on the account's budget,
         # and the latest date_start emitted (a "YYYY-MM-DD" string).
         self._retrying_missing = False
@@ -1219,6 +1238,7 @@ class AdsInsightStream(FacebookSDKStream):
         self._widening_to = None
         self._span_slices = width
         self._span_resize_from = date_obj
+        self._widening_just_failed = True
         today = pendulum.today().date()
         try:
             state = self.get_context_state(self._sync_context)
@@ -1430,6 +1450,11 @@ class AdsInsightStream(FacebookSDKStream):
                     "now older than the 37 months Facebook keeps and can no longer be extracted."
                 )
                 continue
+            if start < oldest_kept and self.effective_granularity == "monthly":
+                # A monthly row covers a whole month (see _first_whole_month).
+                start = self._first_whole_month(oldest_kept)
+                if start > until:
+                    continue
             periods.append(
                 {"from": max(start, oldest_kept), "until": until, "attempts": attempts, "failed_on": failed_on}
             )
@@ -1449,12 +1474,20 @@ class AdsInsightStream(FacebookSDKStream):
         if not getattr(self, "_tracking_missing", False):
             return
         periods = [dict(period) for period in self._missing_periods]
-        for start, until in self._missing_found:
-            if bookmark is None or start >= bookmark:
+        written = self._last_emitted
+        for start, until, failures in self._missing_found:
+            if bookmark is None or written is None:
                 continue
-            periods.append(
-                {"from": start, "until": min(until, bookmark.subtract(days=1)), "attempts": 0, "failed_on": None}
-            )
+            if not any(before is None or written > before for before in failures):
+                # Nothing was written after these dates failed: the next run's
+                # new dates start at or before them.
+                continue
+            # Days before the bookmark this run was handed were loaded by an
+            # earlier run (a failed re-read is not a gap), and days from the
+            # bookmark it finalizes on are the next run's new dates.
+            whole = self._whole_slices(start, until, after=self._bookmark_handed_in, before=bookmark)
+            if whole is not None:
+                periods.append({"from": whole[0], "until": whole[1], "attempts": 0, "failed_on": None})
         given_up = list(self._periods_given_up)
         if len(periods) > MISSING_PERIODS_KEPT:
             dropped = periods[:-MISSING_PERIODS_KEPT]
@@ -1491,6 +1524,32 @@ class AdsInsightStream(FacebookSDKStream):
             for p in periods
         ]
 
+    def _whole_slices(
+        self,
+        start: pendulum.Date,
+        until: pendulum.Date,
+        *,
+        after: pendulum.Date | None,
+        before: pendulum.Date,
+    ) -> tuple[pendulum.Date, pendulum.Date] | None:
+        """The slices of [start, until] that start on or after `after` and end before `before`.
+
+        A period asked for again must start and end where the slices of the
+        run that left it did: a weekly or monthly row is keyed by the start of
+        its slice, so a period cut mid-slice would write a short row over a
+        whole one.
+        """
+        first = last = None
+        current = start
+        while current <= until:
+            following = self._advance_date(current, self._effective_time_increment)
+            end = following.subtract(days=1)
+            if (after is None or current >= after) and end < before and end <= until:
+                first = first or current
+                last = end
+            current = following
+        return (first, last) if first is not None else None
+
     def _step_window(self, report_date: pendulum.Date) -> None:
         """Note the window just left as missing when one of its dates failed.
 
@@ -1504,10 +1563,34 @@ class AdsInsightStream(FacebookSDKStream):
         if self._window_from is not None:
             if report_date <= self._window_from:
                 return
-            if self._dates_failed > self._failed_before_window:
-                self._missing_found.append((self._window_from, report_date.subtract(days=1)))
+            failures = self._failure_snapshots[self._snapshots_before_window :]
+            if failures:
+                self._missing_found.append((self._window_from, report_date.subtract(days=1), failures))
         self._window_from = report_date
-        self._failed_before_window = self._dates_failed
+        self._snapshots_before_window = len(self._failure_snapshots)
+
+    def _new_dates_first(
+        self, report_date: pendulum.Date, range_end: pendulum.Date, ranges: list[tuple]
+    ) -> pendulum.Date:
+        """Split what is left of a one-report plan that no longer fits in one report.
+
+        The plan was one report because the widened width covered the whole run.
+        When that width turns out too large, the rest is asked for in narrower
+        windows -- new dates first, the lookback re-read last, as when the run
+        was planned that way: otherwise the re-read spends the account's last
+        reports and today is not extracted. Returns where to continue.
+        """
+        bookmark = self._bookmark_handed_in
+        if (
+            bookmark is None
+            or not self._lookback_only_near_today()
+            or not report_date < bookmark <= range_end
+            or self._slices_between(report_date, range_end, self._effective_time_increment) <= self._span_slices
+        ):
+            return report_date
+        ranges.append((report_date, bookmark.subtract(days=1), True, None))
+        self._window_from = None
+        return bookmark
 
     def _note_emitted(self, record: dict) -> None:
         date_start = record.get("date_start")
@@ -1524,30 +1607,39 @@ class AdsInsightStream(FacebookSDKStream):
         """
         if not self._tracking_missing or self._window_from is None or self._last_emitted is None:
             return
-        if self._dates_failed - 1 <= self._failed_before_window:
-            return
+        # The last failure is the stop itself.
+        failures = self._failure_snapshots[self._snapshots_before_window : -1]
         last = pendulum.parse(self._last_emitted).date()
-        if last >= self._window_from:
-            self._missing_found.append((self._window_from, last))
+        if failures and last > self._window_from:
+            # Up to the slice before the last one written: that one is in the table.
+            self._missing_found.append((self._window_from, last.subtract(days=1), failures))
 
     def _settle_missing_period(self, period: dict, *, failed: bool, stopped: bool) -> None:
         """Record the outcome of asking again for a period an earlier run left behind."""
         label = self._period_label(period["from"], period["until"])
-        if stopped and not AdsInsightStream._account_not_building:
+        today = pendulum.today().date()
+        if stopped and AdsInsightStream._account_not_building:
+            # Facebook stopped building reports for the whole account: the
+            # period waits for tomorrow, so the next runs today do not spend
+            # the same reports on it, but an account-wide outage that clears in
+            # a few days never gives a period up.
+            period["failed_on"] = today
+            return
+        if stopped and not failed:
             # The account's budget ran out: that says nothing about this period,
             # so it is no attempt. What was extracted before the stop is kept:
             # the period resumes where it stopped, or a period needing more
             # reports than a run gets would start over every run and never end.
-            if not failed and self._missing_stopped_at is not None and self._missing_stopped_at > period["from"]:
+            if self._missing_stopped_at is not None and self._missing_stopped_at > period["from"]:
                 period["from"] = self._missing_stopped_at
             return
-        if not failed and not stopped:
+        if not failed:
             self._missing_periods.remove(period)
             user_logger.info(f"[{self.name}] {label}, which an earlier run could not extract, is now extracted.")
             return
-        # Failed, or Facebook stopped building reports for the account while on
-        # it: an attempt -- once a day (see MISSING_PERIOD_ATTEMPTS).
-        today = pendulum.today().date()
+        # A window of it failed (and the budget may have ended the run after):
+        # an attempt -- once a day (see MISSING_PERIOD_ATTEMPTS) -- so the next
+        # runs today go to the new dates instead of failing the same window.
         if period.get("failed_on") != today:
             period["attempts"] += 1
             period["failed_on"] = today
@@ -1629,7 +1721,10 @@ class AdsInsightStream(FacebookSDKStream):
         elif self._retrying_missing:
             self._missing_stopped_at = date
         else:
-            self._budget_spent_at = date
+            # A run planned as one report reads the lookback first; the next
+            # run continues from the bookmark either way.
+            handed_in = self._bookmark_handed_in
+            self._budget_spent_at = max(date, handed_in) if handed_in is not None else date
 
     def _where_the_budget_ran_out(self) -> str:
         """The sentence naming the date the account's budget ran out, or nothing."""
@@ -3754,6 +3849,10 @@ class AdsInsightStream(FacebookSDKStream):
                 )
             report_date = range_start
             self._window_from = None
+            if new_dates:
+                # Planned as one report at a width tried for the first time; a
+                # missing period may already have shown it does not build.
+                report_date = self._new_dates_first(report_date, range_end, ranges)
             # Use batch processing for parallel report creation
             while report_date <= range_end:
                 if new_dates:
@@ -3885,6 +3984,9 @@ class AdsInsightStream(FacebookSDKStream):
                         # the narrower windows _shrink_span_after_too_large chose.
                         report_date = self._span_resize_from
                         self._span_resize_from = None
+                        if self._widening_just_failed and new_dates:
+                            report_date = self._new_dates_first(report_date, range_end, ranges)
+                        self._widening_just_failed = False
                         continue
 
                     if self._span_failed_from is not None:

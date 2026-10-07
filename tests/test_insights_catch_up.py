@@ -409,7 +409,13 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         with (
             mock.patch.object(stream, "_initialize_client"),
             mock.patch.object(stream, "_create_report_batch", side_effect=created),
-            mock.patch.object(stream, "_process_report_batch", side_effect=lambda *a, **k: iter([{"id": "1"}])),
+            mock.patch.object(
+                stream,
+                "_process_report_batch",
+                side_effect=lambda batch, *a, **k: iter(
+                    [{"id": "1", "date_start": batch[-1]["next_date"].subtract(days=1).to_date_string()}]
+                ),
+            ),
             mock.patch.object(
                 stream,
                 "_advance_batch",
@@ -432,7 +438,7 @@ class TestAPeriodLeftBehindIsAskedForAgain:
     def test_a_window_that_failed_on_the_way_is_kept(self):
         stream = self.stream()
         self.run(stream, lambda start, end: "failed" if start == BEHIND else "ok")
-        assert stream._missing_found[0] == (BEHIND, BEHIND.add(days=WINDOW - 1))
+        assert stream._missing_found[0][:2] == (BEHIND, BEHIND.add(days=WINDOW - 1))
         state = self.finalize(stream, BEHIND.add(days=25))
         assert state[MISSING_PERIODS_STATE_KEY] == [
             {"from": "2024-02-10", "until": "2024-02-19", "attempts": 0},
@@ -449,7 +455,8 @@ class TestAPeriodLeftBehindIsAskedForAgain:
     def test_a_window_at_or_after_the_bookmark_is_not_kept(self):
         stream = self.stream()
         stream._tracking_missing = True
-        stream._missing_found = [(BEHIND.add(days=30), BEHIND.add(days=39))]
+        stream._last_emitted = BEHIND.add(days=40).to_date_string()
+        stream._missing_found = [(BEHIND.add(days=30), BEHIND.add(days=39), [None])]
         state = self.finalize(stream, BEHIND.add(days=30))
         assert MISSING_PERIODS_STATE_KEY not in state
 

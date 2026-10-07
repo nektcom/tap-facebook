@@ -220,7 +220,7 @@ class TestAReportThatCouldNotBeCreatedIsAFailedDate:
         stream._step_window(START)
         self.queue(stream, fb_error(1, http_status=500))
         stream._step_window(UNTIL.add(days=1))
-        assert stream._missing_found == [(START, UNTIL)]
+        assert [found[:2] for found in stream._missing_found] == [(START, UNTIL)]
 
 
 class TestMonthlyStartsInsideFacebooksRetention:

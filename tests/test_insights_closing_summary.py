@@ -123,7 +123,8 @@ class TestEachStreamRecordsWhatItLeft:
     def test_periods_asked_for_first_are_listed_and_cleared(self):
         stream = stream_with_bookmark(BOOKMARK)
         stream._tracking_missing = True
-        stream._missing_found = [(pendulum.date(2024, 2, 1), pendulum.date(2024, 2, 3))]
+        stream._last_emitted = BOOKMARK.to_date_string()
+        stream._missing_found = [(pendulum.date(2024, 2, 1), pendulum.date(2024, 2, 3), [None])]
         state = stream.get_context_state(None)
         with mock.patch(USER):
             stream._finalize_state(state)
