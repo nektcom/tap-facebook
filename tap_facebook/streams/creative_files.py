@@ -52,6 +52,17 @@ DEFAULT_IMAGE_EXTENSION = ".jpg"
 
 DOWNLOAD_TIMEOUT_SECONDS = 60
 
+# A file whose connection drops mid-transfer is fetched once more before it is
+# given up. The fbcdn URL stays valid for the run, and the SDK skips a file that
+# still fails: facebook-ads-n6Rj lost a thumbnail to one IncompleteRead
+# (2026-10-06) that a second request would have fetched.
+DOWNLOAD_ATTEMPTS = 2
+TRANSIENT_DOWNLOAD_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
 
 def _file_extension(url: str) -> str:
     """Return the image extension to store the file under, from the URL path."""
@@ -173,7 +184,20 @@ class CreativeFilesStream(VolumeAttachmentMixin, Stream):
             )
 
     def fetch_attachment(self, attachment: Attachment, local_path: str) -> None:
-        """Stream the file's public fbcdn URL to `local_path`."""
+        """Stream the file's public fbcdn URL to `local_path`, once more if the connection drops."""
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                self._download(attachment, local_path)
+            except TRANSIENT_DOWNLOAD_ERRORS as err:
+                if attempt == DOWNLOAD_ATTEMPTS:
+                    raise
+                internal_logger.warning(
+                    f"[{self.name}] Download of {attachment.file_name} dropped ({err!r}); fetching it again."
+                )
+            else:
+                return
+
+    def _download(self, attachment: Attachment, local_path: str) -> None:
         url = attachment.source["url"]
         with self._download_session.get(
             url,

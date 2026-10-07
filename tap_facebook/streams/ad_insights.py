@@ -689,6 +689,24 @@ def _columns_absent_from_report(message: str, columns: list[str]) -> list[str]:
     return [column for column in columns if column in tokens]
 
 
+class OptionalPartsDidNotJoin(Exception):  # noqa: N818 -- reads as the event, like StopIteration
+    """No row of any optional part matched a row of the core report of the same period.
+
+    Seen once, on facebook-ads-WYkS (2026-10-07, split mode, read again without
+    two refused columns): the core report returned 953 rows and each of the 7
+    optional parts 6,855, none of them matching. The rows were emitted with the
+    ~140 optional columns empty -- over days that had been loaded whole -- and
+    the run ended green. Why the parts disagreed is not known yet.
+    """
+
+    def __init__(self, report_date: str, core_rows: int, part_rows: dict[str, int]) -> None:
+        """Keep the period and the row counts the customer's message names."""
+        super().__init__(report_date)
+        self.report_date = report_date
+        self.core_rows = core_rows
+        self.part_rows = part_rows
+
+
 class AdsInsightStream(FacebookSDKStream):
     name = "adsinsights"
     replication_key = "date_start"
@@ -727,6 +745,15 @@ class AdsInsightStream(FacebookSDKStream):
     # so an exit mid-stream would throw the progress away) and the tap fails the
     # run once every stream is done; see TapFacebook.sync_all.
     _incomplete_without_history: list[str] = []  # noqa: RUF012
+
+    # What each insights stream did not complete in this run, by stream and then
+    # by kind (so finalizing a stream twice does not repeat a line), and whether
+    # the ad account's report limit was among the causes. TapFacebook.sync_all
+    # closes the customer's log with it, after the extraction table: the log
+    # view opens on the most recent lines, and customers read a green run whose
+    # per-stream warnings sat further up as a failure (NEKT-5249, 2026-10-06).
+    _not_completed: dict[str, dict[str, str]] = {}  # noqa: RUF012
+    _account_limit_spent: bool = False
 
     # Whether this run was handed no bookmark at all. Meltano passes no state on
     # a full refresh (nekt-connectors-engine, SingerTap.look_up_state), and a
@@ -882,34 +909,25 @@ class AdsInsightStream(FacebookSDKStream):
         )
 
     def _warn_throttle_is_unrecoverable(self) -> None:
-        """Tell the customer the quota is gone and one request is already the floor."""
+        """Log that the quota is gone and one request is already the floor.
+
+        Internal only since v1.88: the end of the stream tells the customer the
+        same cause once, with what was left (see _why_reports_were_refused and
+        TapFacebook._tell_what_was_not_completed). Until then each stream said it
+        twice in a row -- 14 warnings on facebook-ads-WhFu (2026-10-05, seven
+        insights streams) for one spent limit.
+        """
         if self._last_throttle_code in APP_THROTTLE_ERROR_CODES:
-            user_logger.warning(
-                f"[{self.name}] Facebook's request limit for the Nekt application (shared by every "
-                "connected ad account) was still reached after waiting and retrying. This is not "
-                "specific to your account; the next scheduled run will pick the period up again."
-            )
             internal_logger.warning(
                 f"[{self.name}] App-level throttle (code {self._last_throttle_code}) persisted through "
                 f"{APP_THROTTLE_RETRIES} retries; giving the window up for this run."
             )
             return
         if self._split_mode:
-            user_logger.warning(
-                f"[{self.name}] Facebook is refusing further performance reports for this ad account: its "
-                "request limit is spent. The extraction was already requesting the metrics in smaller reports; "
-                "the rest of the period is left for the next scheduled run."
-            )
             internal_logger.warning(
                 f"[{self.name}] Throttled in split mode; the remaining window is skipped for this run."
             )
             return
-        user_logger.warning(
-            f"[{self.name}] Facebook is still refusing performance reports for this ad account: its "
-            "request limit is spent. The extraction already asks for the whole period in a single "
-            "request, so there is nothing left to reduce on our side. Running this source less "
-            "often, or having fewer tools query the same ad account, keeps the limit from being hit."
-        )
         internal_logger.warning(
             f"[{self.name}] Throttled while already asking for the window in one report (or with "
             "the span shape disabled); no further reduction is available."
@@ -1425,7 +1443,13 @@ class AdsInsightStream(FacebookSDKStream):
             )
         if not periods:
             state.pop(MISSING_PERIODS_STATE_KEY, None)
+            self._leave_for_next_run("missing", None)
             return
+        self._leave_for_next_run(
+            "missing",
+            f"{len(periods)} period(s) Facebook did not build are asked for first in the next run: "
+            f"{', '.join(self._period_label(p['from'], p['until']) for p in periods)}.",
+        )
         state[MISSING_PERIODS_STATE_KEY] = [
             {"from": p["from"].to_date_string(), "until": p["until"].to_date_string(), "attempts": p["attempts"]}
             for p in periods
@@ -1506,6 +1530,22 @@ class AdsInsightStream(FacebookSDKStream):
             return
         state[LAST_SERVED_STATE_KEY] = pendulum.now("UTC").to_iso8601_string()
 
+    def _leave_for_next_run(self, kind: str, text: str | None) -> None:
+        """Record (or, with None, clear) what this stream did not complete, for the closing summary."""
+        notes = AdsInsightStream._not_completed.setdefault(self.name, {})
+        if text is None:
+            notes.pop(kind, None)
+        else:
+            notes[kind] = text
+        if not notes:
+            AdsInsightStream._not_completed.pop(self.name, None)
+
+    def _continues_from(self, fallback: str = "") -> str:
+        """Where the next run resumes, when the account's budget ran out on a known date."""
+        if self._budget_spent_at is None:
+            return fallback
+        return f" from {self._budget_spent_at.to_date_string()}"
+
     def _note_budget_spent_at(self, date: pendulum.Date) -> None:
         """Keep where the account's budget ran out: a missing date, or a re-read cut short."""
         if self._rereading:
@@ -1544,6 +1584,12 @@ class AdsInsightStream(FacebookSDKStream):
             f"[{self.name}] Lookback re-read incomplete: {self._reread_failed} date(s) failed, stopped at "
             f"{self._reread_stopped_at}. Not counted as missing dates."
         )
+        stopped_at = f" at {self._reread_stopped_at.to_date_string()}" if self._reread_stopped_at else ""
+        self._leave_for_next_run(
+            "reread",
+            "the new dates are loaded; the re-read of recent days already loaded (the lookback, for "
+            f"conversions attributed late) stopped{stopped_at} and continues in the next run.",
+        )
 
     def _loader_replaces_the_table(self) -> bool:
         """Whether the destination swaps this stream's table for what this run extracted.
@@ -1563,8 +1609,15 @@ class AdsInsightStream(FacebookSDKStream):
 
     def _why_reports_were_refused(self) -> str:
         """The cause to name to the customer, from what this run actually saw."""
+        if AdsInsightStream._account_not_building:
+            return "Facebook is not building performance reports for this ad account right now"
         if self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
             return "the ad account's request limit was already spent"
+        if self._last_throttle_code in APP_THROTTLE_ERROR_CODES:
+            return (
+                "Facebook's request limit for the Nekt application, shared by every connected ad account, "
+                "was reached"
+            )
         if self._report_too_large_seen:
             return "Facebook said the report was too large to build"
         return "Facebook did not build them"
@@ -1602,10 +1655,17 @@ class AdsInsightStream(FacebookSDKStream):
         replaced = self._loader_replaces_the_table()
         why = self._why_reports_were_refused()
         stopped = self._where_the_budget_ran_out()
+        if self._dates_failed and self._last_throttle_code in ACCOUNT_THROTTLE_ERROR_CODES:
+            AdsInsightStream._account_limit_spent = True
         if records_emitted:
             if not self._dates_failed:
                 return
             if not replaced:
+                self._leave_for_next_run(
+                    "dates",
+                    f"partly updated: {self._dates_failed} date(s) not extracted ({why}); the next run picks "
+                    f"them up{self._continues_from()}.",
+                )
                 user_logger.warning(
                     f"[{self.name}] This stream was only partially updated: Facebook refused the performance "
                     f"reports for {self._dates_failed} date(s) ({why}). The dates that were extracted are in "
@@ -1619,6 +1679,11 @@ class AdsInsightStream(FacebookSDKStream):
                 )
                 return
             AdsInsightStream._incomplete_without_history.append(self.name)
+            self._leave_for_next_run(
+                "dates",
+                f"partly loaded on a run that replaces the table ({why}); the run is marked as failed and the "
+                f"next runs continue{self._continues_from(' from the last date extracted')}.",
+            )
             user_logger.error(
                 f"[{self.name}] This extraction was only partial: Facebook refused the performance reports "
                 f"for {self._dates_failed} date(s) ({why}). With no earlier data to add to, the table now "
@@ -1638,12 +1703,21 @@ class AdsInsightStream(FacebookSDKStream):
 
         if not replaced:
             if has_history:
+                self._leave_for_next_run(
+                    "dates",
+                    f"not updated in this run ({why}); the data loaded before is untouched and the next run "
+                    f"continues{self._continues_from(' from where it stopped')}.",
+                )
                 user_logger.warning(
                     f"[{self.name}] This stream was not updated in this run: Facebook refused the performance "
                     f"reports for {self._dates_failed} date(s) ({why}). The data extracted previously is "
                     f"untouched and the next run picks up from where it stopped.{stopped}"
                 )
             else:
+                self._leave_for_next_run(
+                    "dates",
+                    f"no data yet ({why}); the next run tries again from the configured start date.",
+                )
                 user_logger.warning(
                     f"[{self.name}] This stream has no data yet: Facebook refused the performance reports for "
                     f"{self._dates_failed} date(s) ({why}). Nothing was written for it in this run; the next "
@@ -1809,6 +1883,8 @@ class AdsInsightStream(FacebookSDKStream):
 
         message = fb_err.api_error_message() or str(fb_err)
         # What the account already refused in this run stays out of every read.
+        # OptionalPartsDidNotJoin is not absorbed here: the caller gives the
+        # period up (see _give_up_on_unjoined_parts).
         remaining = [column for column in columns if column not in AdsInsightStream._columns_refused_on_read]
         narrowing = self._what_a_read_refusal_leaves_out(message, remaining, report_date)
         if narrowing is None:
@@ -1846,6 +1922,8 @@ class AdsInsightStream(FacebookSDKStream):
                     return None
                 refused, absent = narrowing
                 continue
+            except OptionalPartsDidNotJoin:
+                raise
             except Exception:  # noqa: BLE001
                 # This runs inside the caller's `except FacebookRequestError`, so
                 # anything raised here -- a dropped connection, a read timeout, a
@@ -2380,6 +2458,11 @@ class AdsInsightStream(FacebookSDKStream):
                         f"[{self.name}] Report creation for {part_label} returned "
                         f"HTTP {response.status()} instead of 200; no report_run_id was issued."
                     )
+                    # A failed date, not an empty one: until v1.88 the window was
+                    # walked past uncounted -- a gap behind the bookmark that no
+                    # warning named and no run asked for again (GcvQ, TIno, ZpnZ:
+                    # HTTP 502/503, 2026-09-28 to 10-01, all green).
+                    self._dates_failed += 1
                     return []
                 created.append(
                     {"name": part_name, "columns": part_columns, "report_run_id": response.json()["report_run_id"]}
@@ -2422,6 +2505,7 @@ class AdsInsightStream(FacebookSDKStream):
                     f"HTTP {fb_err.http_status()}): {message}",
                     exc_info=True,
                 )
+                self._dates_failed += 1  # see the non-200 answer above
                 return []
             except requests.exceptions.RequestException as net_err:
                 # The retry inside _request_report_creation did not get through.
@@ -2752,11 +2836,18 @@ class AdsInsightStream(FacebookSDKStream):
                     )
                     yield from self._merge_part_results(parts, jobs, report_date, fields=first_read_fields)
                     break
+                except OptionalPartsDidNotJoin as mismatch:
+                    self._give_up_on_unjoined_parts(mismatch, parts)
+                    break
                 except FacebookRequestError as fb_err:
                     # The report is built; a refused column is answered by
                     # reading it again with a narrower field list, which costs
                     # nothing, before falling back to recreating it.
-                    rows = self._reread_without_refused_columns(fb_err, parts, jobs, columns, report_date)
+                    try:
+                        rows = self._reread_without_refused_columns(fb_err, parts, jobs, columns, report_date)
+                    except OptionalPartsDidNotJoin as mismatch:
+                        self._give_up_on_unjoined_parts(mismatch, parts)
+                        break
                     if rows is not None:
                         yield from rows
                         break
@@ -2930,6 +3021,9 @@ class AdsInsightStream(FacebookSDKStream):
         merged: dict[str, dict] = {}
         order: list[str] = []
         orphans = 0
+        # Rows read and rows joined per optional part (see OptionalPartsDidNotJoin).
+        part_rows: dict[str, int] = {}
+        part_joined: dict[str, int] = {}
         for index, (part, job) in enumerate(zip(parts, jobs)):
             part_fields = None
             if fields is not None:
@@ -2957,10 +3051,13 @@ class AdsInsightStream(FacebookSDKStream):
                     merged[key] = obj.export_all_data()
                     order.append(key)
                     continue
+                name = part.get("name") or str(index)
+                part_rows[name] = part_rows.get(name, 0) + 1
                 base = merged.get(key)
                 if base is None:
                     orphans += 1
                     continue
+                part_joined[name] = part_joined.get(name, 0) + 1
                 for column, value in obj.export_all_data().items():
                     if column not in base:
                         base[column] = value
@@ -2969,6 +3066,11 @@ class AdsInsightStream(FacebookSDKStream):
                 f"[{self.name}] {orphans} row(s) of the optional parts for {report_date} had no matching row in "
                 "the core report and were dropped."
             )
+        if order and part_rows and not any(part_joined.values()):
+            # Not one optional row found its base: the parts do not describe the
+            # same rows, and emitting the core rows would write their optional
+            # columns empty. A row is written whole or not at all.
+            raise OptionalPartsDidNotJoin(report_date, len(order), part_rows)
         if len(parts) > 1:
             internal_logger.info(
                 f"[{self.name}] Combined {len(parts)} parts for {report_date} into {len(order)} row(s)."
@@ -3301,6 +3403,28 @@ class AdsInsightStream(FacebookSDKStream):
             f"{SPAN_RETRIES + 1} attempts; built={built} missing={missing}; last job error: {self._last_job_error!r}."
         )
 
+    def _give_up_on_unjoined_parts(self, mismatch: OptionalPartsDidNotJoin, parts: list[dict]) -> None:
+        """Leave a period whose optional parts matched none of its core rows for the next run.
+
+        Counted as a failed date, so the period is kept and asked for again
+        (MISSING_PERIODS_STATE_KEY) and the days already in the table keep the
+        values they were loaded with instead of having their optional columns
+        overwritten with nothing.
+        """
+        self._dates_failed += 1
+        part_total = sum(mismatch.part_rows.values())
+        user_logger.warning(
+            f"[{self.name}] Facebook returned the extra metric groups for {mismatch.report_date} in a shape that "
+            f"does not match the main report: none of their {part_total} row(s) matched the {mismatch.core_rows} "
+            "row(s) of the main metrics. The period was left for the next run rather than written with those "
+            "columns empty."
+        )
+        internal_logger.warning(
+            f"[{self.name}] act_{self.config.get('account_id')}: optional parts of {mismatch.report_date} joined "
+            f"no core row; core={mismatch.core_rows} rows, parts={mismatch.part_rows}, report ids="
+            f"{[part.get('report_run_id') for part in parts]}, split mode={self._split_mode}."
+        )
+
     def _mark_account_not_building(self, report_label: str, why: str) -> None:
         """Stop this stream, and every later insights stream of the run, cheaply.
 
@@ -3418,6 +3542,28 @@ class AdsInsightStream(FacebookSDKStream):
             report_start = oldest_allowed_start_date
         return report_start
 
+    def _first_whole_month(self, start: pendulum.Date) -> pendulum.Date:
+        """The first day of the month to start a monthly sync from, within Facebook's 37 months.
+
+        The start is clamped to the oldest day Facebook keeps (_get_start_date)
+        before it is aligned; aligning after the clamp moved it back into the
+        month Facebook cuts, and every report was refused with "(#3018) The
+        start date of the time range cannot be beyond 37 months" -- all six
+        insights streams of facebook-ads-9huQ skipped 2023-09 to 2026-03 on a
+        full sync that ended green (2026-10-06). A monthly row covers a whole
+        month, so that month is left out instead.
+        """
+        month = start.start_of("month")
+        oldest_allowed = pendulum.today().date().subtract(months=37)
+        if month >= oldest_allowed:
+            return month
+        first_whole = month.add(months=1)
+        user_logger.info(
+            f"[{self.name}] Monthly reports start on {first_whole.to_date_string()}: Facebook keeps 37 months, "
+            f"which no longer cover all of {month.format('MMMM YYYY')}, and each row covers a whole month."
+        )
+        return first_whole
+
     def _lookback_start(self, bookmark: pendulum.Date, lookback_days: int) -> pendulum.Date:
         """Where an incremental run starts: the lookback, but only over recent days.
 
@@ -3479,7 +3625,7 @@ class AdsInsightStream(FacebookSDKStream):
 
         # For monthly granularity, align start date to the first day of the month
         if self.effective_granularity == "monthly":
-            report_date = report_date.start_of("month")
+            report_date = self._first_whole_month(report_date)
 
         columns = self._get_selected_columns()
 

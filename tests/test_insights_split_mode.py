@@ -402,7 +402,7 @@ class TestTheRowsOfThePartsAreCombined:
         ]
 
         with mock.patch("tap_facebook.streams.ad_insights.internal_logger") as internal_log:
-            rows = stream._merge_part_results(parts, [built([key]), built([ghost])], START.to_date_string())
+            rows = stream._merge_part_results(parts, [built([key]), built([key, ghost])], START.to_date_string())
 
         assert [row["ad_id"] for row in rows] == ["a"]
         assert "1 row(s) of the optional parts" in internal_log.warning.call_args.args[0]

@@ -534,6 +534,8 @@ class TapFacebook(Tap):
         success (see AdsInsightStream._fail_if_nothing_extracted).
         """
         AdsInsightStream._incomplete_without_history = []
+        AdsInsightStream._not_completed = {}
+        AdsInsightStream._account_limit_spent = False
         # Read before any stream runs: the streams add bookmarks to this same
         # state as they go, so later it no longer tells what the run was handed.
         AdsInsightStream._run_started_without_state = not _state_has_a_bookmark(self.state)
@@ -547,6 +549,7 @@ class TapFacebook(Tap):
         )
         self._serve_the_longest_waiting_insights_stream_first()
         super().sync_all(*args, **kwargs)
+        self._tell_what_was_not_completed()
         incomplete = list(AdsInsightStream._incomplete_without_history)
         if not incomplete:
             return
@@ -560,6 +563,33 @@ class TapFacebook(Tap):
             "on a table the destination replaces (full sync, first run or FULL_TABLE); their bookmarks were finalized."
         )
         sys.exit(1)
+
+    def _tell_what_was_not_completed(self) -> None:
+        """Close the log with what the run left for the next ones, right after the extraction table.
+
+        The customer's log view opens on the most recent lines. The per-stream
+        warnings sit further up, and the table alone shows a stream refused by
+        Facebook as "0 rows", like one with nothing new: customers read such
+        green runs as failures and opened support tickets (NEKT-5249,
+        2026-10-06). Printed only when something was left.
+        """
+        left = AdsInsightStream._not_completed
+        if not left:
+            return
+        lines = ["**Not completed in this run**", ""]
+        for name, notes in left.items():
+            lines.extend(f"- **{name}**: {text}" for text in notes.values())
+        if AdsInsightStream._account_limit_spent:
+            lines += [
+                "",
+                (
+                    "Facebook limits how many performance reports one ad account can request in a few hours. "
+                    "The limit is shared by all the performance report streams of this source and by any other "
+                    "tool reading the same ad account. Running this source less often, or having fewer tools "
+                    "query the same ad account, keeps the limit from being hit."
+                ),
+            ]
+        user_logger.warning("\n".join(lines))
 
     def _serve_the_longest_waiting_insights_stream_first(self) -> None:
         """Order the insights streams by when each last got a report, oldest first.

@@ -308,3 +308,49 @@ def test_get_records_without_a_volume_uploads_nothing(monkeypatch: pytest.Monkey
 
     assert list(stream.get_records({"creative_id": "creative-1", "image_url": IMAGE_URL})) == []
     assert api.uploads == []
+
+
+def _one_attachment():
+    context = {"creative_id": "creative-1", "ad_id": "ad-1", "image_url": IMAGE_URL}
+    stream = _files_stream()
+    return stream, next(iter(stream.iter_attachments(context)))
+
+
+def test_a_download_dropped_mid_transfer_is_fetched_again(tmp_path) -> None:
+    """facebook-ads-n6Rj lost a thumbnail to one IncompleteRead (2026-10-06)."""
+    import requests
+    from unittest import mock
+
+    stream, attachment = _one_attachment()
+    dropped = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead(512 bytes read)")
+    with mock.patch.object(stream, "_download", side_effect=[dropped, None]) as download:
+        stream.fetch_attachment(attachment, str(tmp_path / "f.jpg"))
+    assert download.call_count == 2
+
+
+def test_a_download_that_keeps_dropping_is_left_to_the_sdk(tmp_path) -> None:
+    """The SDK logs the file and skips it, as before; only one more request is spent."""
+    import requests
+    from unittest import mock
+
+    stream, attachment = _one_attachment()
+    dropped = requests.exceptions.ConnectionError("reset")
+    with mock.patch.object(stream, "_download", side_effect=dropped) as download, pytest.raises(
+        requests.exceptions.ConnectionError
+    ):
+        stream.fetch_attachment(attachment, str(tmp_path / "f.jpg"))
+    assert download.call_count == 2
+
+
+def test_a_refused_download_is_not_asked_for_again(tmp_path) -> None:
+    """A 403/404 from fbcdn is an answer, not a dropped connection."""
+    import requests
+    from unittest import mock
+
+    stream, attachment = _one_attachment()
+    refused = requests.exceptions.HTTPError("403 Forbidden")
+    with mock.patch.object(stream, "_download", side_effect=refused) as download, pytest.raises(
+        requests.exceptions.HTTPError
+    ):
+        stream.fetch_attachment(attachment, str(tmp_path / "f.jpg"))
+    assert download.call_count == 1

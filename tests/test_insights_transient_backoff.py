@@ -130,8 +130,10 @@ class TestAppLimitIsWaitedOut:
         assert trigger.call_count == APP_THROTTLE_RETRIES + 1
         assert stream._throttled is True, "after the retries the caller stops the batch as before"
         assert stream._last_throttle_code == 4
-        message = user_log.warning.call_args.args[0]
-        assert "Nekt application" in message and "not specific to your account" in message
+        # Since v1.88 the cause is told once, at the end of the stream, not at the throttle point.
+        user_log.warning.assert_not_called()
+        why = stream._why_reports_were_refused()
+        assert "Nekt application" in why and "shared by every connected ad account" in why
 
     def test_the_account_limit_is_still_final_on_the_first_refusal(self, sleep):
         stream = make_stream()
