@@ -264,3 +264,22 @@ class TestMonthlyStartsInsideFacebooksRetention:
             list(stream.get_records(None))
         assert starts[0] >= TODAY.subtract(months=37)
         assert starts[0].day == 1
+
+
+class TestTheMismatchLeavesWhatToDiagnoseItWith:
+    def test_sample_keys_of_each_side_are_logged(self):
+        """Live check on WYkS (2026-10-08) could not reproduce zero joins: the next one is logged."""
+        stream = make_stream()
+        stream._split_mode = True
+        jobs = [built([row("a"), row("b")]), built([row("x")]), built([row("a")])]
+        with (
+            mock.patch.object(stream, "_run_parts_to_completion", return_value=jobs),
+            mock.patch("tap_facebook.streams.ad_insights.time.sleep"),
+            mock.patch(USER),
+            mock.patch("tap_facebook.streams.ad_insights.internal_logger") as internal,
+        ):
+            list(stream._process_report_batch([span_report()], CORE, 1))
+        said = [call.args[0] for call in internal.warning.call_args_list if "joined no core row" in call.args[0]][0]
+        assert "'core': ['2026-09-29|c|s|a', '2026-09-29|c|s|b']" in said
+        assert "'standard': ['2026-09-29|c|s|x']" in said
+        assert "'results'" not in said, "a part that joined is not in the diagnosis"

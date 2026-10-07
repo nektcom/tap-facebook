@@ -706,14 +706,30 @@ class OptionalPartsDidNotJoin(Exception):  # noqa: N818 -- reads as the event, l
     optional parts 6,855, none of them matching. The rows were emitted with the
     ~140 optional columns empty -- over days that had been loaded whole -- and
     the run ended green. Why the parts disagreed is not known yet.
+
+    Checked live on that account on 2026-10-08 (same window and parameters):
+    reading a report with or without a field list returns the same rows; an
+    optional part with no metric (attribution_setting) returns every ad on
+    every day, with or without delivery (3,033 rows: 337 ads x 9 days), and the
+    core rows include days that only carry attributed actions. So orphans and
+    partial joins are normal -- but that day 915 of 961 core rows joined, not
+    zero. The keys sampled on each side (`samples`) are logged to find out what
+    differed when it happens again.
     """
 
-    def __init__(self, report_date: str, core_rows: int, part_rows: dict[str, int]) -> None:
-        """Keep the period and the row counts the customer's message names."""
+    def __init__(
+        self,
+        report_date: str,
+        core_rows: int,
+        part_rows: dict[str, int],
+        samples: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Keep the period, the row counts the customer's message names, and a few keys of each side."""
         super().__init__(report_date)
         self.report_date = report_date
         self.core_rows = core_rows
         self.part_rows = part_rows
+        self.samples = samples or {}
 
 
 class AdsInsightStream(FacebookSDKStream):
@@ -3248,9 +3264,11 @@ class AdsInsightStream(FacebookSDKStream):
         merged: dict[str, dict] = {}
         order: list[str] = []
         orphans = 0
-        # Rows read and rows joined per optional part (see OptionalPartsDidNotJoin).
+        # Rows read and rows joined per optional part, and a few keys of each
+        # side for the diagnosis (see OptionalPartsDidNotJoin).
         part_rows: dict[str, int] = {}
         part_joined: dict[str, int] = {}
+        samples: dict[str, list[str]] = {}
         for index, (part, job) in enumerate(zip(parts, jobs)):
             part_fields = None
             if fields is not None:
@@ -3273,6 +3291,9 @@ class AdsInsightStream(FacebookSDKStream):
                     user_logger.warning(f"[{self.name}] Unexpected result type for {report_date}")
                     continue
                 key = self._generate_hash_id(adinsight=obj, report_breakdowns=self.report_breakdowns)
+                side = samples.setdefault(part.get("name") or str(index), [])
+                if len(side) < 3:
+                    side.append(self._key_of(obj))
                 if index == 0:
                     obj["id"] = key
                     merged[key] = obj.export_all_data()
@@ -3298,7 +3319,13 @@ class AdsInsightStream(FacebookSDKStream):
             # An optional part none of whose rows found a base does not describe
             # the same rows as the core report; emitting the core rows would
             # write that part's columns empty. A row is written whole or not at all.
-            raise OptionalPartsDidNotJoin(report_date, len(order), unjoined)
+            core_name = parts[0].get("name") or "0"
+            raise OptionalPartsDidNotJoin(
+                report_date,
+                len(order),
+                unjoined,
+                {name: keys for name, keys in samples.items() if name == core_name or name in unjoined},
+            )
         if len(parts) > 1:
             internal_logger.info(
                 f"[{self.name}] Combined {len(parts)} parts for {report_date} into {len(order)} row(s)."
@@ -3631,6 +3658,12 @@ class AdsInsightStream(FacebookSDKStream):
             f"{SPAN_RETRIES + 1} attempts; built={built} missing={missing}; last job error: {self._last_job_error!r}."
         )
 
+    def _key_of(self, adinsight: AdsInsights) -> str:
+        """The fields the row id is made of, readable: date|campaign|adset|ad[|breakdowns]."""
+        values = [adinsight.get(field, "") for field in ("date_start", "campaign_id", "adset_id", "ad_id")]
+        values += [str(adinsight.get(breakdown, "")) for breakdown in self.report_breakdowns]
+        return "|".join(str(value) for value in values)
+
     def _give_up_on_unjoined_parts(self, mismatch: OptionalPartsDidNotJoin, parts: list[dict]) -> None:
         """Leave a period whose optional parts matched none of its core rows for the next run.
 
@@ -3650,7 +3683,8 @@ class AdsInsightStream(FacebookSDKStream):
         internal_logger.warning(
             f"[{self.name}] act_{self.config.get('account_id')}: optional parts of {mismatch.report_date} joined "
             f"no core row; core={mismatch.core_rows} rows, parts={mismatch.part_rows}, report ids="
-            f"{[part.get('report_run_id') for part in parts]}, split mode={self._split_mode}."
+            f"{[part.get('report_run_id') for part in parts]}, split mode={self._split_mode}, "
+            f"sample keys (date|campaign|adset|ad) per part={mismatch.samples}."
         )
 
     def _mark_account_not_building(self, report_label: str, why: str) -> None:
