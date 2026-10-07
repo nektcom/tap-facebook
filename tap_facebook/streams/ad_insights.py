@@ -555,19 +555,24 @@ LAST_SERVED_STATE_KEY = "insights_last_served"
 
 # Periods a run could not extract while it went on to later dates -- a report
 # Facebook failed to build, a window it built only in part -- kept in the state
-# and asked for first by the next runs. Until v1.86 the lookback re-read is what
+# and asked for again by the next runs. Until v1.86 the lookback re-read is what
 # picked them up, by re-reading the days before the bookmark; it now covers only
 # the last days before today (see _lookback_start), so a period that failed
 # while a stream was catching up would otherwise stay missing behind the
-# bookmark. Each retry is one report; a period still failing after
-# MISSING_PERIOD_ATTEMPTS runs is dropped and named to the customer.
+# bookmark.
+#
+# Kept periods are asked for after the new dates (never before: a period that
+# keeps failing must not hold the new dates back), and at most once a day: a
+# period that failed, or that the account's budget cut, waits for tomorrow
+# (`tried_on`). After MISSING_PERIOD_ATTEMPTS days of failure it is asked for
+# once a week instead, until it builds or leaves the 37 months Facebook keeps:
+# a period is never given up while Facebook may still build it. A simulation of
+# 31k runs (2026-10-08) showed giving up after three failing days lost days that
+# Facebook built once a bad week was over -- 287 of them days v1.85 did extract.
 MISSING_PERIODS_STATE_KEY = "insights_missing_periods"
 MISSING_PERIOD_ATTEMPTS = 3
-MISSING_PERIODS_KEPT = 20
-# Attempts are counted per day, not per run: a period that failed today is asked
-# for again tomorrow. On a pipeline running every hour, three failing runs are
-# three hours -- too short for Facebook's transient failures, and each retry is
-# one of the account's few reports.
+MISSING_PERIOD_SLOW_RETRY_DAYS = 7
+MISSING_PERIODS_KEPT = 100
 
 # A span job that Facebook fails to build is recreated this many times before
 # the shape is given up on. Most job failures are transient (~14% of jobs die
@@ -886,6 +891,7 @@ class AdsInsightStream(FacebookSDKStream):
         # Where a retry of a missing period stopped on the account's budget,
         # and the latest date_start emitted (a "YYYY-MM-DD" string).
         self._retrying_missing = False
+        self._a_job_failed = False
         self._missing_stopped_at: pendulum.Date | None = None
         self._last_emitted: str | None = None
         self._periods_given_up: list[str] = []
@@ -1439,7 +1445,7 @@ class AdsInsightStream(FacebookSDKStream):
                 start = pendulum.parse(str(item["from"])).date()
                 until = pendulum.parse(str(item["until"])).date()
                 attempts = int(item.get("attempts", 0))
-                failed_on = item.get("failed_on")
+                failed_on = item.get("tried_on")
                 failed_on = pendulum.parse(str(failed_on)).date() if failed_on else None
             except Exception:  # noqa: BLE001 -- an unreadable entry is dropped, not trusted
                 internal_logger.warning(f"[{self.name}] Dropped an unreadable missing period: {item!r}")
@@ -1456,14 +1462,18 @@ class AdsInsightStream(FacebookSDKStream):
                 if start > until:
                     continue
             periods.append(
-                {"from": max(start, oldest_kept), "until": until, "attempts": attempts, "failed_on": failed_on}
+                {"from": max(start, oldest_kept), "until": until, "attempts": attempts, "tried_on": failed_on}
             )
         return sorted(periods, key=lambda period: period["from"])
 
     @staticmethod
     def _due_today(period: dict) -> bool:
-        """Whether a kept period is asked for in this run: not when it already failed today."""
-        return period.get("failed_on") is None or period["failed_on"] < pendulum.today().date()
+        """Whether a kept period is asked for in this run: once a day, once a week after repeated failures."""
+        tried_on = period.get("tried_on")
+        if tried_on is None:
+            return True
+        wait = MISSING_PERIOD_SLOW_RETRY_DAYS if period.get("attempts", 0) >= MISSING_PERIOD_ATTEMPTS else 1
+        return tried_on.add(days=wait) <= pendulum.today().date()
 
     def _save_missing_periods(self, state: dict, bookmark: pendulum.Date | None) -> None:
         """Keep the periods still missing behind the bookmark for the next runs.
@@ -1487,7 +1497,7 @@ class AdsInsightStream(FacebookSDKStream):
             # bookmark it finalizes on are the next run's new dates.
             whole = self._whole_slices(start, until, after=self._bookmark_handed_in, before=bookmark)
             if whole is not None:
-                periods.append({"from": whole[0], "until": whole[1], "attempts": 0, "failed_on": None})
+                periods.append({"from": whole[0], "until": whole[1], "attempts": 0, "tried_on": None})
         given_up = list(self._periods_given_up)
         if len(periods) > MISSING_PERIODS_KEPT:
             dropped = periods[:-MISSING_PERIODS_KEPT]
@@ -1519,7 +1529,7 @@ class AdsInsightStream(FacebookSDKStream):
                 "from": p["from"].to_date_string(),
                 "until": p["until"].to_date_string(),
                 "attempts": p["attempts"],
-                **({"failed_on": p["failed_on"].to_date_string()} if p.get("failed_on") else {}),
+                **({"tried_on": p["tried_on"].to_date_string()} if p.get("tried_on") else {}),
             }
             for p in periods
         ]
@@ -1532,7 +1542,7 @@ class AdsInsightStream(FacebookSDKStream):
         after: pendulum.Date | None,
         before: pendulum.Date,
     ) -> tuple[pendulum.Date, pendulum.Date] | None:
-        """The slices of [start, until] that start on or after `after` and end before `before`.
+        """The slices of [start, until] that end on or after `after` and end before `before`.
 
         A period asked for again must start and end where the slices of the
         run that left it did: a weekly or monthly row is keyed by the start of
@@ -1544,7 +1554,7 @@ class AdsInsightStream(FacebookSDKStream):
         while current <= until:
             following = self._advance_date(current, self._effective_time_increment)
             end = following.subtract(days=1)
-            if (after is None or current >= after) and end < before and end <= until:
+            if (after is None or end >= after) and end < before and end <= until:
                 first = first or current
                 last = end
             current = following
@@ -1568,6 +1578,43 @@ class AdsInsightStream(FacebookSDKStream):
                 self._missing_found.append((self._window_from, report_date.subtract(days=1), failures))
         self._window_from = report_date
         self._snapshots_before_window = len(self._failure_snapshots)
+
+    def _keep_what_an_older_version_would_have_reread(self, context: dict | None, start: pendulum.Date) -> None:
+        """On the first run after an upgrade, keep the days v1.85 would still have re-read.
+
+        Up to v1.85 the lookback re-read the days before the bookmark on every
+        run, and that is what picked up a window the run had walked past (a
+        failed job given up, a 5xx at creation): those were never recorded. The
+        lookback now only covers recent days, so on a stream behind them the
+        days before the bookmark would never be read again. They are kept once,
+        as a period asked for again, on the first run that finds no trace of
+        this version in the state (LAST_SERVED_STATE_KEY is written on the
+        first report created).
+        """
+        bookmark = self._bookmark_handed_in
+        if bookmark is None or not self._lookback_only_near_today():
+            return
+        try:
+            state = self.get_context_state(context)
+        except Exception:  # noqa: BLE001 -- a state hiccup must not stop the extraction
+            return
+        if state.get(LAST_SERVED_STATE_KEY):
+            return
+        lookback_days = self.config.get("report_definition", {}).get("lookback_window") or 0
+        skipped_from = bookmark.subtract(days=lookback_days)
+        if skipped_from >= start:
+            return
+        oldest_kept = pendulum.today().date().subtract(months=37)
+        period = {"from": max(skipped_from, oldest_kept), "until": start.subtract(days=1), "attempts": 0}
+        if period["from"] > period["until"]:
+            return
+        if any(p["from"] == period["from"] and p["until"] == period["until"] for p in self._missing_periods):
+            return
+        self._missing_periods.append({**period, "tried_on": None})
+        internal_logger.info(
+            f"[{self.name}] First run on this version: keeping {self._period_label(period['from'], period['until'])} "
+            "(re-read by the lookback of earlier versions, no longer by this one) as a period to ask for again."
+        )
 
     def _new_dates_first(
         self, report_date: pendulum.Date, range_end: pendulum.Date, ranges: list[tuple]
@@ -1618,38 +1665,31 @@ class AdsInsightStream(FacebookSDKStream):
         """Record the outcome of asking again for a period an earlier run left behind."""
         label = self._period_label(period["from"], period["until"])
         today = pendulum.today().date()
-        if stopped and AdsInsightStream._account_not_building:
-            # Facebook stopped building reports for the whole account: the
-            # period waits for tomorrow, so the next runs today do not spend
-            # the same reports on it, but an account-wide outage that clears in
-            # a few days never gives a period up.
-            period["failed_on"] = today
-            return
-        if stopped and not failed:
-            # The account's budget ran out: that says nothing about this period,
-            # so it is no attempt. What was extracted before the stop is kept:
-            # the period resumes where it stopped, or a period needing more
-            # reports than a run gets would start over every run and never end.
-            if self._missing_stopped_at is not None and self._missing_stopped_at > period["from"]:
-                period["from"] = self._missing_stopped_at
-            return
-        if not failed:
+        if not failed and not stopped:
             self._missing_periods.remove(period)
             user_logger.info(f"[{self.name}] {label}, which an earlier run could not extract, is now extracted.")
             return
-        # A window of it failed (and the budget may have ended the run after):
-        # an attempt -- once a day (see MISSING_PERIOD_ATTEMPTS) -- so the next
-        # runs today go to the new dates instead of failing the same window.
-        if period.get("failed_on") != today:
-            period["attempts"] += 1
-            period["failed_on"] = today
-        if period["attempts"] < MISSING_PERIOD_ATTEMPTS:
+        if stopped and not failed and self._missing_stopped_at is not None and self._missing_stopped_at > period["from"]:
+            # What was extracted before the account's budget ran out is kept:
+            # the period resumes where it stopped, or one needing more reports
+            # than a run gets would start over every day and never end.
+            period["from"] = self._missing_stopped_at
+        if not failed or AdsInsightStream._account_not_building:
+            # The budget ran out, or Facebook stopped building reports for the
+            # whole account: that says nothing about this period. It waits for
+            # tomorrow without an attempt -- an account-wide outage clears in a
+            # few days and must not give periods up.
+            period["tried_on"] = today
             return
-        self._missing_periods.remove(period)
-        self._periods_given_up.append(label)
+        # A window or a job of it failed: an attempt, once a day.
+        if period.get("tried_on") != today:
+            period["attempts"] += 1
+            period["tried_on"] = today
+        if period["attempts"] != MISSING_PERIOD_ATTEMPTS:
+            return
         user_logger.warning(
             f"[{self.name}] Facebook did not build the report for {label} on {MISSING_PERIOD_ATTEMPTS} different "
-            "days. Those dates are no longer requested automatically and stay missing from the table."
+            f"days. Those dates are asked for again once a week, after the new dates, until Facebook builds them."
         )
 
     def _lookback_only_near_today(self) -> bool:
@@ -2217,6 +2257,13 @@ class AdsInsightStream(FacebookSDKStream):
                 "since": current_date.start_of("month").to_date_string(),
                 "until": current_date.end_of("month").to_date_string(),
             }
+        increment = self._effective_time_increment
+        if isinstance(increment, int) and increment > 1:
+            # One report per slice must ask for the whole slice: asking for its
+            # first day wrote a one-day row under the id of the whole week (the
+            # id is keyed by date_start), and the MERGE replaced the week with it.
+            last_day = min(current_date.add(days=increment - 1), pendulum.today().date())
+            return {"since": current_date.to_date_string(), "until": last_day.to_date_string()}
         return {
             "since": current_date.to_date_string(),
             "until": current_date.to_date_string(),
@@ -2966,6 +3013,13 @@ class AdsInsightStream(FacebookSDKStream):
                 self._job_too_large = False
                 jobs = self._run_parts_to_completion(parts, report_date)
                 if jobs is None:
+                    if not self._job_too_large:
+                        # While a kept period is asked for again, a job that did not
+                        # build is that period's failure even when the retry is then
+                        # refused by the account's budget -- which alone reads as "no
+                        # attempt" (see _settle_missing_period). A report too large
+                        # is answered by a narrower width, not by giving up.
+                        self._a_job_failed = True
                     if span_until is not None:
                         if self._job_too_large and self._shrink_span_after_too_large(
                             date_obj, span_until, report_date, time_increment
@@ -3749,7 +3803,10 @@ class AdsInsightStream(FacebookSDKStream):
         full_lookback = bookmark.subtract(days=lookback_days)
         if not self._lookback_only_near_today():
             return full_lookback
-        recent = pendulum.today().date().subtract(days=lookback_days)
+        # One more day than the lookback: a run handed yesterday's bookmark starts
+        # where v1.85 did (bookmark - lookback), so the last day of an attribution
+        # window is still re-read on a once-a-day schedule.
+        recent = pendulum.today().date().subtract(days=lookback_days + 1)
         return min(bookmark, max(full_lookback, recent))
 
     def _generate_hash_id(self, adinsight: AdsInsights, report_breakdowns: list[str]):
@@ -3823,23 +3880,28 @@ class AdsInsightStream(FacebookSDKStream):
             self._tracking_missing = True
         if self._tracking_missing:
             self._missing_periods = self._read_missing_periods(context)
+        if self._tracking_missing:
+            self._keep_what_an_older_version_would_have_reread(context, report_date)
         due = [period for period in self._missing_periods if self._due_today(period)]
         if due:
             user_logger.info(
-                f"[{self.name}] Asking first for {len(due)} period(s) that an earlier run could not extract: "
-                f"{', '.join(self._period_label(p['from'], p['until']) for p in due)}."
+                f"[{self.name}] After the new dates, asking again for {len(due)} period(s) that an earlier run "
+                f"could not extract: {', '.join(self._period_label(p['from'], p['until']) for p in due)}."
             )
         stop_stream = False
 
         # Before the ranges: whether one report covers the run depends on the width.
         self._try_wider(report_date, sync_end_date, time_increment)
-        ranges = [(period["from"], period["until"], False, period) for period in due] + [
-            (start, until, rereading, None)
-            for start, until, rereading in self._extraction_ranges(report_date, sync_end_date)
-        ]
+        planned = self._extraction_ranges(report_date, sync_end_date)
+        ranges = (
+            [(start, until, False, None) for start, until, rereading in planned if not rereading]
+            + [(period["from"], period["until"], False, period) for period in due]
+            + [(start, until, True, None) for start, until, rereading in planned if rereading]
+        )
         for range_start, range_end, rereading, missing_period in ranges:
             self._rereading = rereading
             self._retrying_missing = missing_period is not None
+            self._a_job_failed = False
             self._missing_stopped_at = None
             failed_before_range = self._dates_failed
             new_dates = not rereading and missing_period is None
@@ -4036,7 +4098,13 @@ class AdsInsightStream(FacebookSDKStream):
                 # period's own failures are the rest. Those are reported by the
                 # period (kept or given up), not as dates the next run picks up.
                 own_failures = self._dates_failed - failed_before_range - (1 if stop_stream else 0)
-                self._settle_missing_period(missing_period, failed=own_failures > 0, stopped=stop_stream)
+                # A job of the period that failed before the budget ended the run
+                # is its failure; one that failed and then built is not.
+                self._settle_missing_period(
+                    missing_period,
+                    failed=own_failures > 0 or (stop_stream and self._a_job_failed),
+                    stopped=stop_stream,
+                )
                 self._dates_failed -= max(own_failures, 0)
                 self._retrying_missing = False
             if rereading:

@@ -16,6 +16,7 @@ from facebook_business.adobjects.adsinsights import AdsInsights
 from nekt_singer_sdk import Tap
 
 from tap_facebook.streams.ad_insights import (
+    LAST_SERVED_STATE_KEY,
     MISSING_PERIOD_ATTEMPTS,
     MISSING_PERIODS_KEPT,
     MISSING_PERIODS_STATE_KEY,
@@ -59,8 +60,12 @@ def make(stream_state: dict, config: dict | None = None) -> AdsInsightStream:
     return stream
 
 
-def bookmark_at(date: pendulum.Date, **extra) -> dict:
-    return {"replication_key": "date_start", "replication_key_value": date.to_date_string(), **extra}
+def bookmark_at(date: pendulum.Date, *, upgraded: bool = True, **extra) -> dict:
+    """A stream's state handed a bookmark; `upgraded=False` is a state last written by v1.85."""
+    state = {"replication_key": "date_start", "replication_key_value": date.to_date_string(), **extra}
+    if upgraded:
+        state[LAST_SERVED_STATE_KEY] = "2026-10-01T00:00:00Z"
+    return state
 
 
 def run(stream: AdsInsightStream, budget: int = 99, fails=lambda start: False):
@@ -104,7 +109,7 @@ class TestAnUpToDateStreamCostsOneReport:
     def test_new_dates_and_lookback_that_fit_in_one_report_are_one_report(self):
         """v1.85 paid one report; v1.86-v1.88 split it into two on every run."""
         created, _ = run(make(bookmark_at(TODAY.subtract(days=1))))
-        assert created == [(TODAY.subtract(days=7), TODAY)]
+        assert created == [(TODAY.subtract(days=8), TODAY)]
 
     def test_a_narrow_width_climbs_back_on_an_up_to_date_stream(self):
         """Only the new dates counted for the climb, so 1-2 new days never widened a 3-day width again."""
@@ -112,8 +117,8 @@ class TestAnUpToDateStreamCostsOneReport:
         stream = make(bookmark_at(TODAY.subtract(days=1), **{SPAN_WIDTH_STATE_KEY: marker}))
         _, state = run(stream)
         assert state[SPAN_WIDTH_STATE_KEY]["slices"] > 3
-        # The next run covers new dates and lookback (8 days) in one report.
-        created, state = run(make({k: v for k, v in state.items() if k != "insights_last_served"}))
+        # The next run (bookmark now today) covers new dates and lookback in one report.
+        created, state = run(make(state))
         assert created == [(TODAY.subtract(days=7), TODAY)]
 
 
@@ -225,26 +230,30 @@ class TestMissingPeriods:
     def test_a_retry_cut_by_the_budget_resumes_where_it_stopped(self):
         """A period needing more reports than a run gets used to start over every run and never end."""
         narrow = {"slices": 15, "since": TODAY.to_date_string(), "wider_failed_on": TODAY.to_date_string()}
-        state = bookmark_at(BEHIND, **{MISSING_PERIODS_STATE_KEY: [self.PERIOD], SPAN_WIDTH_STATE_KEY: narrow})
-        created, state = run(make(state), budget=2)
+        up_to_date = TODAY.subtract(days=1)
+        state = bookmark_at(up_to_date, **{MISSING_PERIODS_STATE_KEY: [self.PERIOD], SPAN_WIDTH_STATE_KEY: narrow})
+        created, state = run(make(state), budget=3)
         assert created == [
+            (TODAY.subtract(days=8), TODAY),  # the new dates and the lookback, in one report
             (pendulum.date(2025, 4, 1), pendulum.date(2025, 4, 15)),
             (pendulum.date(2025, 4, 16), pendulum.date(2025, 4, 30)),
         ]
-        assert state[MISSING_PERIODS_STATE_KEY] == [{"from": "2025-05-01", "until": "2025-05-01", "attempts": 0}]
+        assert state[MISSING_PERIODS_STATE_KEY] == [
+            {"from": "2025-05-01", "until": "2025-05-01", "attempts": 0, "tried_on": TODAY.to_date_string()}
+        ]
 
     def test_a_period_that_failed_today_waits_for_tomorrow(self):
-        failed_today = {**self.PERIOD, "attempts": 1, "failed_on": TODAY.to_date_string()}
+        failed_today = {**self.PERIOD, "attempts": 1, "tried_on": TODAY.to_date_string()}
         created, state = run(make(bookmark_at(BEHIND, **{MISSING_PERIODS_STATE_KEY: [failed_today]})))
         assert all(start >= BEHIND for start, _ in created)
         assert state[MISSING_PERIODS_STATE_KEY] == [failed_today]
 
     def test_attempts_are_counted_once_a_day(self):
         april = lambda start: start.year == 2025 and start.month == 4  # noqa: E731
-        yesterday = {**self.PERIOD, "attempts": 1, "failed_on": TODAY.subtract(days=1).to_date_string()}
+        yesterday = {**self.PERIOD, "attempts": 1, "tried_on": TODAY.subtract(days=1).to_date_string()}
         _, state = run(make(bookmark_at(BEHIND, **{MISSING_PERIODS_STATE_KEY: [yesterday]})), fails=april)
         assert state[MISSING_PERIODS_STATE_KEY][0]["attempts"] == 2
-        assert state[MISSING_PERIODS_STATE_KEY][0]["failed_on"] == TODAY.to_date_string()
+        assert state[MISSING_PERIODS_STATE_KEY][0]["tried_on"] == TODAY.to_date_string()
 
     def test_facebook_not_building_while_on_a_period_postpones_it_without_an_attempt(self):
         """An account-wide outage clears in a few days; it must not give a period up."""
@@ -256,7 +265,7 @@ class TestMissingPeriods:
         with mock.patch(USER):
             stream._settle_missing_period(period, failed=False, stopped=True)
         assert period["attempts"] == 0
-        assert period["failed_on"] == TODAY
+        assert period["tried_on"] == TODAY
         assert not stream._due_today(period)
 
     def test_the_budget_spent_on_a_period_does_not_name_it_as_where_the_next_run_continues(self):
@@ -264,16 +273,17 @@ class TestMissingPeriods:
         run(make(state), budget=0)
         note = AdsInsightStream._not_completed["adsinsights"]["dates"]
         assert "2025-04-01" not in note
-        assert "continues from where it stopped" in note
+        assert f"continues from {BEHIND}" in note
 
-    def test_a_period_given_up_is_named_and_not_promised(self):
+    def test_a_period_failing_again_is_named_as_asked_for_again_not_as_new_dates(self):
         april = lambda start: start.year == 2025 and start.month == 4  # noqa: E731
         last = {**self.PERIOD, "attempts": MISSING_PERIOD_ATTEMPTS - 1}
         _, state = run(make(bookmark_at(BEHIND, **{MISSING_PERIODS_STATE_KEY: [last]})), fails=april)
-        assert MISSING_PERIODS_STATE_KEY not in state
+        assert state[MISSING_PERIODS_STATE_KEY][0]["attempts"] == MISSING_PERIOD_ATTEMPTS
         notes = AdsInsightStream._not_completed["adsinsights"]
         assert "dates" not in notes, "the new dates were all extracted"
-        assert notes["given_up"] == "no longer asked for, Facebook did not build them: 2025-04-01 to 2025-05-01."
+        assert "given_up" not in notes
+        assert "2025-04-01 to 2025-05-01" in notes["missing"]
 
     def test_too_many_periods_are_told_once(self):
         stream = make(bookmark_at(BEHIND))
@@ -402,12 +412,13 @@ class TestSecondReview:
         """Before: no attempt, no shrink -- asked for first on every run, never ending, new dates never reached."""
         narrow = {"slices": 15, "since": TODAY.to_date_string(), "wider_failed_on": TODAY.to_date_string()}
         period = {"from": "2025-04-01", "until": "2025-05-01", "attempts": 0}
-        state = bookmark_at(BEHIND, **{MISSING_PERIODS_STATE_KEY: [period], SPAN_WIDTH_STATE_KEY: narrow})
-        _, state = run(make(state), budget=1, fails=lambda start: start == pendulum.date(2025, 4, 16))
+        up_to_date = TODAY.subtract(days=1)
+        state = bookmark_at(up_to_date, **{MISSING_PERIODS_STATE_KEY: [period], SPAN_WIDTH_STATE_KEY: narrow})
+        _, state = run(make(state), budget=2, fails=lambda start: start == pendulum.date(2025, 4, 16))
         kept = state[MISSING_PERIODS_STATE_KEY][0]
-        assert kept["attempts"] == 1 and kept["failed_on"] == TODAY.to_date_string()
-        created, _ = run(make({k: v for k, v in state.items() if k != "insights_last_served"}), budget=1)
-        assert created[0][0] >= BEHIND, "the next run today goes to the new dates"
+        assert kept["attempts"] == 1 and kept["tried_on"] == TODAY.to_date_string()
+        created, _ = run(make(state), budget=5)
+        assert all(start >= TODAY.subtract(days=8) for start, _ in created), "not asked for again today"
 
     def test_a_failure_after_the_last_written_day_is_not_a_gap(self):
         stream = make(bookmark_at(BEHIND))
@@ -458,8 +469,94 @@ class TestSecondReview:
         assert stream._whole_slices(jan, jan.add(days=27), after=None, before=jan.add(days=19)) == (jan, jan.add(days=13))
         # A window ending mid-slice keeps the slices it holds whole.
         assert stream._whole_slices(jan, jan.add(days=16), after=None, before=jan.add(days=60)) == (jan, jan.add(days=13))
-        # Slices that start before the bookmark the run was handed were loaded before.
+        # A slice that straddles the bookmark the run was handed holds days never loaded: kept whole.
         assert stream._whole_slices(jan, jan.add(days=27), after=jan.add(days=3), before=jan.add(days=60)) == (
+            jan,
+            jan.add(days=27),
+        )
+        # Slices that end before it were loaded by an earlier run.
+        assert stream._whole_slices(jan, jan.add(days=27), after=jan.add(days=8), before=jan.add(days=60)) == (
             jan.add(days=7),
             jan.add(days=27),
         )
+
+
+class TestFinalReview:
+    """Final pre-release review (2026-10-08): simulation of 31k runs against v1.85."""
+
+    def test_the_first_run_after_the_upgrade_keeps_what_v185_would_have_reread(self):
+        """v1.85 walked past failed windows and relied on the lookback before the bookmark to read them again."""
+        stream = make(bookmark_at(BEHIND, upgraded=False))
+        _, state = run(stream, budget=0)
+        assert state[MISSING_PERIODS_STATE_KEY] == [
+            {"from": BEHIND.subtract(days=7).to_date_string(), "until": BEHIND.subtract(days=1).to_date_string(), "attempts": 0}
+        ]
+
+    def test_the_kept_lookback_is_read_after_the_new_dates_and_not_kept_again(self):
+        stream = make(bookmark_at(BEHIND, upgraded=False))
+        created, state = run(stream)
+        assert created[-1] == (BEHIND.subtract(days=7), BEHIND.subtract(days=1))
+        assert MISSING_PERIODS_STATE_KEY not in state
+        # The first report created marks the stream as on this version (here the
+        # creation is mocked, so the mark is set by hand).
+        state[LAST_SERVED_STATE_KEY] = "2026-10-08T00:00:00Z"
+        created, _ = run(make({**state, "replication_key_value": BEHIND.to_date_string()}))
+        assert all(start >= BEHIND for start, _ in created)
+
+    def test_an_up_to_date_stream_upgraded_from_v185_rereads_nothing_more(self):
+        created, state = run(make(bookmark_at(TODAY.subtract(days=1), upgraded=False)))
+        assert created == [(TODAY.subtract(days=8), TODAY)]
+        assert MISSING_PERIODS_STATE_KEY not in state
+
+    def test_a_period_whose_job_fails_and_whose_retry_meets_the_budget_counts_an_attempt(self):
+        """Before: no attempt, asked for again every run and never given up."""
+        stream = make(bookmark_at(TODAY.subtract(days=1)))
+        stream._reset_run_state()
+        period = {"from": pendulum.date(2025, 4, 1), "until": pendulum.date(2025, 4, 10), "attempts": 0}
+        stream._missing_periods = [period]
+        stream._a_job_failed = True
+        with mock.patch(USER):
+            stream._settle_missing_period(period, failed=True, stopped=True)
+        assert period["attempts"] == 1 and period["tried_on"] == TODAY
+
+    def test_a_job_that_failed_and_then_built_does_not_fail_the_period(self):
+        april = {"from": "2025-04-01", "until": "2025-04-10", "attempts": 0}
+        stream = make(bookmark_at(TODAY.subtract(days=1), **{MISSING_PERIODS_STATE_KEY: [april]}))
+        original = stream._settle_missing_period
+
+        def after_a_transient_job_failure(period, *, failed, stopped):
+            assert stream._a_job_failed is True
+            return original(period, failed=failed, stopped=stopped)
+
+        def queue(current_date, span_until, label, columns, ti):
+            if current_date.year == 2025:
+                stream._a_job_failed = True  # failed once, then built on the retry
+            return [{"name": "all", "columns": columns, "report_run_id": "1"}]
+
+        def process(batch, columns, ti):
+            for report in batch:
+                yield {"id": "1", "date_start": (report["until_obj"] or report["date_obj"]).to_date_string()}
+
+        with (
+            mock.patch.object(stream, "_initialize_client"),
+            mock.patch.object(stream, "_queue_report_parts", side_effect=queue),
+            mock.patch.object(stream, "_process_report_batch", side_effect=process),
+            mock.patch.object(stream, "_settle_missing_period", side_effect=after_a_transient_job_failure),
+            mock.patch("tap_facebook.streams.ad_insights.time.sleep"),
+            mock.patch(USER),
+        ):
+            for record in stream.get_records(None):
+                stream._increment_stream_state(record, context=None)
+            state = stream.get_context_state(None)
+            stream._finalize_state(state)
+        assert MISSING_PERIODS_STATE_KEY not in state
+
+    def test_a_weekly_report_per_slice_asks_for_the_whole_week(self):
+        """A one-day report wrote a one-day row under the id of the whole week."""
+        weekly = {**CONFIG, "report_definition": {**CONFIG["report_definition"], "time_increment_days": 7}}
+        stream = make(bookmark_at(BEHIND), config=weekly)
+        assert stream._get_time_range(pendulum.date(2025, 9, 1)) == {"since": "2025-09-01", "until": "2025-09-07"}
+
+    def test_a_daily_report_per_slice_is_still_one_day(self):
+        stream = make(bookmark_at(BEHIND))
+        assert stream._get_time_range(pendulum.date(2025, 9, 1)) == {"since": "2025-09-01", "until": "2025-09-01"}

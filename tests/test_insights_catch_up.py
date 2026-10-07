@@ -63,9 +63,17 @@ def _fresh_process_state():
 def stream_with_bookmark(
     bookmark: pendulum.Date | None, name: str = "adsinsights", config: dict | None = None
 ) -> AdsInsightStream:
-    """A stream as the SDK leaves it at the start of a run handed `bookmark`."""
+    """A stream as the SDK leaves it at the start of a run handed `bookmark`, already on this version."""
     state = (
-        {"bookmarks": {name: {"replication_key": "date_start", "replication_key_value": bookmark.to_date_string()}}}
+        {
+            "bookmarks": {
+                name: {
+                    "replication_key": "date_start",
+                    "replication_key_value": bookmark.to_date_string(),
+                    LAST_SERVED_STATE_KEY: "2026-10-01T00:00:00Z",
+                }
+            }
+        }
         if bookmark is not None
         else {}
     )
@@ -91,7 +99,8 @@ class TestTheLookbackOnlyReReadsRecentDays:
         stream = stream_with_bookmark(TODAY.subtract(days=1))
         with mock.patch(USER):
             start = stream._get_start_date(None)
-        assert start == TODAY.subtract(days=7)
+        # Where v1.85 started for yesterday's bookmark (bookmark - lookback).
+        assert start == TODAY.subtract(days=8)
 
     def test_a_bookmark_just_outside_the_window_is_not_reread(self):
         bookmark = TODAY.subtract(days=10)
@@ -108,7 +117,7 @@ class TestTheLookbackOnlyReReadsRecentDays:
         said = user.info.call_args.args[0]
         assert said.startswith(
             f"[adsinsights] Incremental sync, applying lookback '7' to the bookmark start date "
-            f"'{TODAY.subtract(days=2)}'. Syncing reports starting on '{TODAY.subtract(days=7)}'."
+            f"'{TODAY.subtract(days=2)}'. Syncing reports starting on '{TODAY.subtract(days=8)}'."
         )
 
     def test_monthly_slices_keep_the_full_lookback(self):
@@ -197,7 +206,7 @@ class TestNewDatesComeBeforeTheReRead:
 
         create, _, _ = self.run_get_records(stream, created)
         starts = [call.kwargs["start_date"] for call in create.call_args_list]
-        assert starts == [bookmark, TODAY.subtract(days=7)]
+        assert starts == [bookmark, TODAY.subtract(days=8)]
         assert create.call_args_list[1].kwargs["end_date"] == bookmark.subtract(days=1)
 
     def test_the_budget_running_out_on_new_dates_skips_the_reread(self):
@@ -234,7 +243,7 @@ class TestNewDatesComeBeforeTheReRead:
         assert records == [{"id": "1"}]
         assert stream._dates_failed == 0
         assert stream._reread_failed == 1
-        assert stream._reread_stopped_at == TODAY.subtract(days=7)
+        assert stream._reread_stopped_at == TODAY.subtract(days=8)
         warnings = [call.args[0] for call in user.warning.call_args_list]
         assert not any("partially updated" in text or "not updated" in text for text in warnings)
         infos = [call.args[0] for call in user.info.call_args_list]
@@ -460,14 +469,15 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         state = self.finalize(stream, BEHIND.add(days=30))
         assert MISSING_PERIODS_STATE_KEY not in state
 
-    def test_a_kept_period_is_asked_for_first_and_cleared_once_extracted(self):
+    def test_a_kept_period_is_asked_for_after_the_new_dates_and_cleared_once_extracted(self):
+        """After, never before: a period that keeps failing must not hold the new dates back."""
         missing = [{"from": "2024-01-05", "until": "2024-01-14", "attempts": 1}]
         stream = self.stream(missing=missing)
         calls, user = self.run(stream, lambda start, end: "ok")
-        assert calls[0] == (pendulum.date(2024, 1, 5), pendulum.date(2024, 1, 14))
-        assert calls[1][0] == BEHIND
+        assert calls[0][0] == BEHIND
+        assert calls[-1] == (pendulum.date(2024, 1, 5), pendulum.date(2024, 1, 14))
         infos = [call.args[0] for call in user.info.call_args_list]
-        assert any("Asking first for 1 period(s)" in text and "2024-01-05 to 2024-01-14" in text for text in infos)
+        assert any("asking again for 1 period(s)" in text and "2024-01-05 to 2024-01-14" in text for text in infos)
         recovered = "2024-01-05 to 2024-01-14, which an earlier run could not extract, is now extracted"
         assert any(recovered in text for text in infos)
         state = self.finalize(stream, TODAY)
@@ -479,20 +489,25 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         self.run(stream, lambda start, end: "failed" if start.year == 2024 and start.month == 1 else "ok")
         state = self.finalize(stream, TODAY)
         assert state[MISSING_PERIODS_STATE_KEY] == [
-            {"from": "2024-01-05", "until": "2024-01-14", "attempts": 1, "failed_on": TODAY.to_date_string()}
+            {"from": "2024-01-05", "until": "2024-01-14", "attempts": 1, "tried_on": TODAY.to_date_string()}
         ]
 
-    def test_a_period_still_failing_is_dropped_and_named(self):
+    def test_a_period_still_failing_is_kept_and_asked_for_weekly(self):
+        """Never given up while Facebook may still build it: three failing days slow it down to once a week."""
         missing = [{"from": "2024-01-05", "until": "2024-01-14", "attempts": MISSING_PERIOD_ATTEMPTS - 1}]
         stream = self.stream(missing=missing)
         _, user = self.run(stream, lambda start, end: "failed" if start.year == 2024 and start.month == 1 else "ok")
         warnings = [call.args[0] for call in user.warning.call_args_list]
         assert any(
-            "did not build the report for 2024-01-05 to 2024-01-14" in text and "no longer requested" in text
+            "did not build the report for 2024-01-05 to 2024-01-14" in text and "once a week" in text
             for text in warnings
         )
         state = self.finalize(stream, TODAY)
-        assert MISSING_PERIODS_STATE_KEY not in state
+        kept = state[MISSING_PERIODS_STATE_KEY][0]
+        assert kept["attempts"] == MISSING_PERIOD_ATTEMPTS
+        period = {"attempts": MISSING_PERIOD_ATTEMPTS, "tried_on": TODAY.subtract(days=6)}
+        assert not AdsInsightStream._due_today(period)
+        assert AdsInsightStream._due_today({**period, "tried_on": TODAY.subtract(days=7)})
 
     def test_a_retry_cut_by_the_budget_is_not_an_attempt(self):
         missing = [{"from": "2024-01-05", "until": "2024-01-14", "attempts": 2}]
@@ -507,7 +522,7 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         """The retry yields dates before the bookmark: the floor keeps it."""
         missing = [{"from": "2024-01-05", "until": "2024-01-14", "attempts": 0}]
         stream = self.stream(missing=missing)
-        self.run(stream, lambda start, end: "ok" if start.month == 1 else "budget")
+        self.run(stream, lambda start, end: "ok")
         state = self.finalize(stream, pendulum.date(2024, 1, 14))
         assert state["replication_key_value"] == BEHIND.to_date_string()
         assert MISSING_PERIODS_STATE_KEY not in state
