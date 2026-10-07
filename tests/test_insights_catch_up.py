@@ -138,15 +138,32 @@ class TestTheLookbackOnlyReReadsRecentDays:
         assert f"'{TODAY.subtract(months=37)}'" in said
 
 
+def narrowed(stream: AdsInsightStream, slices: int = 3) -> AdsInsightStream:
+    """A width Facebook refused to go beyond today, so the run cannot cover its period in one report."""
+    stream.get_context_state(None)[SPAN_WIDTH_STATE_KEY] = {
+        "slices": slices,
+        "since": TODAY.to_date_string(),
+        "wider_failed_on": TODAY.to_date_string(),
+    }
+    return stream
+
+
 class TestNewDatesComeBeforeTheReRead:
-    def test_a_recent_bookmark_splits_the_period(self):
+    def test_a_recent_bookmark_splits_a_period_wider_than_one_report(self):
         stream = stream_with_bookmark(TODAY.subtract(days=2))
         stream._bookmark_handed_in = TODAY.subtract(days=2)
+        stream._span_slices = 3
         ranges = stream._extraction_ranges(TODAY.subtract(days=7), TODAY)
         assert ranges == [
             (TODAY.subtract(days=2), TODAY, False),
             (TODAY.subtract(days=7), TODAY.subtract(days=3), True),
         ]
+
+    def test_a_period_that_fits_in_one_report_is_one_report(self):
+        """An up-to-date stream: v1.86-v1.88 split it and paid two reports a run for what one covers."""
+        stream = stream_with_bookmark(TODAY.subtract(days=2))
+        stream._bookmark_handed_in = TODAY.subtract(days=2)
+        assert stream._extraction_ranges(TODAY.subtract(days=7), TODAY) == [(TODAY.subtract(days=7), TODAY, False)]
 
     def test_a_bookmark_far_behind_is_one_period(self):
         bookmark = pendulum.date(2024, 2, 10)
@@ -173,7 +190,7 @@ class TestNewDatesComeBeforeTheReRead:
 
     def test_get_records_asks_for_the_new_dates_first(self):
         bookmark = TODAY.subtract(days=2)
-        stream = stream_with_bookmark(bookmark)
+        stream = narrowed(stream_with_bookmark(bookmark))
 
         def created(*, start_date, end_date, **kwargs):
             return [{"next_date": end_date.add(days=1)}]
@@ -185,7 +202,7 @@ class TestNewDatesComeBeforeTheReRead:
 
     def test_the_budget_running_out_on_new_dates_skips_the_reread(self):
         bookmark = TODAY.subtract(days=2)
-        stream = stream_with_bookmark(bookmark)
+        stream = narrowed(stream_with_bookmark(bookmark))
 
         def refused(**kwargs):
             stream._throttled = True
@@ -202,7 +219,7 @@ class TestNewDatesComeBeforeTheReRead:
 
     def test_the_budget_running_out_on_the_reread_is_not_a_missing_date(self):
         bookmark = TODAY.subtract(days=2)
-        stream = stream_with_bookmark(bookmark)
+        stream = narrowed(stream_with_bookmark(bookmark))
         calls = []
 
         def created(*, start_date, end_date, **kwargs):
@@ -454,7 +471,9 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         stream = self.stream(missing=missing)
         self.run(stream, lambda start, end: "failed" if start.year == 2024 and start.month == 1 else "ok")
         state = self.finalize(stream, TODAY)
-        assert state[MISSING_PERIODS_STATE_KEY] == [{"from": "2024-01-05", "until": "2024-01-14", "attempts": 1}]
+        assert state[MISSING_PERIODS_STATE_KEY] == [
+            {"from": "2024-01-05", "until": "2024-01-14", "attempts": 1, "failed_on": TODAY.to_date_string()}
+        ]
 
     def test_a_period_still_failing_is_dropped_and_named(self):
         missing = [{"from": "2024-01-05", "until": "2024-01-14", "attempts": MISSING_PERIOD_ATTEMPTS - 1}]
@@ -495,12 +514,12 @@ class TestAPeriodLeftBehindIsAskedForAgain:
         assert periods == []
         assert "older than the 37 months" in user.warning.call_args.args[0]
 
-    def test_monthly_slices_keep_the_full_lookback_instead(self):
-        """The old order: the lookback before the bookmark re-reads the gap."""
+    def test_monthly_slices_keep_a_failed_month_too(self):
+        """Until v1.88 only daily slices were tracked; a failed month behind the bookmark was never read again."""
         stream = self.stream(config={**SAMPLE_CONFIG, "performance_granularity": "monthly"})
         self.run(stream, lambda start, end: "failed" if start == BEHIND.start_of("month") else "ok")
-        assert stream._tracking_missing is False
-        assert stream._missing_found == []
+        assert stream._tracking_missing is True
+        assert stream._missing_found[0][0] == BEHIND.start_of("month")
 
 
 class TestTheWindowClimbsBackOneStepAtATime:

@@ -128,7 +128,7 @@ class TestEachStreamRecordsWhatItLeft:
         with mock.patch(USER):
             stream._finalize_state(state)
         assert left()["missing"] == (
-            "1 period(s) Facebook did not build are asked for first in the next run: 2024-02-01 to 2024-02-03."
+            "1 period(s) Facebook did not build are asked for again in the next runs: 2024-02-01 to 2024-02-03."
         )
         stream._missing_found = []
         stream._finalize_state(state)

@@ -548,8 +548,12 @@ class TapFacebook(Tap):
             )
         )
         self._serve_the_longest_waiting_insights_stream_first()
-        super().sync_all(*args, **kwargs)
-        self._tell_what_was_not_completed()
+        try:
+            super().sync_all(*args, **kwargs)
+        finally:
+            # Also when a stream ends the run with sys.exit: what the streams
+            # before it left is still worth telling.
+            self._tell_what_was_not_completed()
         incomplete = list(AdsInsightStream._incomplete_without_history)
         if not incomplete:
             return
