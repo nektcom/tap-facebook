@@ -88,6 +88,19 @@ tap-facebook --help
 tap-facebook --config CONFIG --discover > ./catalog.json
 ```
 
+## API quirks
+
+- **`creative_media_type` understates aggregated reports (NEKT-5768, 2026-10-08).** In an async insights report
+  above the ad level (`level=campaign`, as `campaign_insights` uses), requesting `creative_media_type` makes Facebook
+  sum only part of the ads of each row, silently: spend, impressions and clicks of 3 of 34 ads for a campaign-day on
+  a customer's account, and spend 0 for campaigns whose ads were all left out (`social_spend` alone kept its full
+  value). Periods up to ~2024-09 came back right, later ones wrong. The same report without the field, the field at
+  `level=ad`, and the synchronous endpoint return the full numbers, so a quick check in the Graph API Explorer does
+  not reproduce it: it needs an async report (POST `act_<id>/insights`, then read the report). Since v1.89 the field
+  is not requested above the ad level and its column arrives empty there (`FIELDS_THAT_SKEW_AGGREGATED_REPORTS`).
+  Data loaded by v1.55-v1.88 with the standard metrics group on is wrong and is only fixed by reading the period
+  again (reset the stream's bookmark; the merge overwrites the rows in place).
+
 ## Contributing
 
 This project uses parent-child streams. Learn more about them [here](https://gitlab.com/meltano/sdk/-/blob/main/docs/parent_streams.md).

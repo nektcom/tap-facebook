@@ -354,6 +354,24 @@ FIELDS_NOT_BUILT_BY_FACEBOOK = {
     "result_values_performance_indicator": "async job fails with 2/1504044 even alone since 2026-09-11 (beta group)",
 }
 
+# Fields that make Facebook understate every metric of a report aggregated above
+# the ad (level campaign, adset or account). With `creative_media_type` in an
+# async campaign report, Facebook sums only part of the ads of each campaign and
+# says nothing: on a customer's ad account (2026-10-08) the row of a campaign for
+# one day held the spend, impressions and clicks of exactly 3 of its 34 ads (1.4%
+# of its spend), the whole day 3.7% of the account's real spend, and campaigns
+# whose ads were all left out came back with spend 0 (only social_spend kept
+# its full value). The same report without the field, the field at level=ad,
+# and the synchronous endpoint all return the full numbers. Periods up to
+# ~2024-09 came back right, later ones wrong. Found by bisecting the 192 fields
+# of that campaign_insights report (NEKT-5768); the tap asks for the field
+# since v1.55. The column stays in the schema and arrives empty
+# at these levels. There is no way to ask for it back: every number of the row
+# depends on it.
+FIELDS_THAT_SKEW_AGGREGATED_REPORTS = {
+    "creative_media_type": "Facebook then sums only part of the ads of each row",
+}
+
 # Sub-properties of the AdsActionStats / AdsHistogramStats nested objects.
 # Same rule: pinned so an SDK bump cannot reshape nested records.
 ACTION_STATS_FIELDS = [
@@ -770,6 +788,11 @@ class AdsInsightStream(FacebookSDKStream):
     # so an exit mid-stream would throw the progress away) and the tap fails the
     # run once every stream is done; see TapFacebook.sync_all.
     _incomplete_without_history: list[str] = []  # noqa: RUF012
+
+    # Selected fields this stream does not request because of its level (see
+    # FIELDS_THAT_SKEW_AGGREGATED_REPORTS); set by _get_selected_columns on the
+    # instance, read once per run to tell the customer the columns stay empty.
+    _left_empty_at_this_level: frozenset[str] = frozenset()
 
     @property
     def _dates_failed(self) -> int:
@@ -3710,6 +3733,12 @@ class AdsInsightStream(FacebookSDKStream):
             "this process so the other insights streams do not repeat the cost."
         )
 
+    def _fields_that_skew_this_level(self, columns: list[str]) -> frozenset[str]:
+        """The selected fields that would make Facebook understate a report at this level."""
+        if self.report_level == "ad":
+            return frozenset()
+        return frozenset(f for f in FIELDS_THAT_SKEW_AGGREGATED_REPORTS if f in columns)
+
     def _get_selected_columns(self) -> list[str]:
         columns = [keys[1] for keys, data in self.metadata.items() if data.selected and len(keys) > 0]
         if not columns:
@@ -3747,8 +3776,21 @@ class AdsInsightStream(FacebookSDKStream):
                 f"[{self.name}] {len(refused_earlier)} field(s) not requested because this ad account "
                 f"refused to return them earlier in this run: {', '.join(sorted(refused_earlier))}"
             )
+        # Fields that understate the metrics of a report aggregated above the ad
+        # (see FIELDS_THAT_SKEW_AGGREGATED_REPORTS). insights_included_fields
+        # does not bring them back: the whole row would be wrong. A field the
+        # source already excludes by configuration is not counted here, so the
+        # customer is not told Facebook is the reason.
+        skewing = self._fields_that_skew_this_level([c for c in columns if c not in excluded])
+        self._left_empty_at_this_level = skewing
+        if skewing:
+            internal_logger.info(
+                f"[{self.name}] {len(skewing)} field(s) not requested at level={self.report_level}: "
+                + ", ".join(f"{f} ({FIELDS_THAT_SKEW_AGGREGATED_REPORTS[f]})" for f in sorted(skewing))
+            )
         excluded |= not_built
         excluded |= refused_earlier
+        excluded |= skewing
         if excluded:
             columns = [column for column in columns if column not in excluded]
 
@@ -3893,6 +3935,13 @@ class AdsInsightStream(FacebookSDKStream):
             report_date = self._first_whole_month(report_date)
 
         columns = self._get_selected_columns()
+        if self._left_empty_at_this_level:
+            user_logger.info(
+                f"[{self.name}] Column(s) {', '.join(sorted(self._left_empty_at_this_level))} left empty: asking "
+                f"Facebook for them in a report by {self.report_level} makes it count only part of the ads, which "
+                "would understate spend and every other metric. All other columns are extracted as usual; the "
+                "values per ad are in the ad-level insights table (adsinsights)."
+            )
 
         retry_count = 0
         batch_size = self.config.get("ad_insights_report_batch_size") or 30
